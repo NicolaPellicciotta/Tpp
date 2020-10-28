@@ -1,0 +1,70 @@
+#vario spessori mui per migliorare la visione del batterio (solo makeThickTrap)
+execfile('makeTrap.py')
+
+powers=[7.]
+speed=50.
+xyres=0.25
+zres=2.*xyres
+
+myPower=powers[0]
+print '\nare you using '+str(myPower)+' mW, really?\n'
+traps=None
+
+#griglia di traps
+Nx=8#9
+Ny=16#27
+Dx=25.#30.
+Dy=15.#10.
+Nrep=2#9
+
+#makeThickTrap
+gateDepth=[0.25,0.5,1.,2.]
+wallThickness=[0.5,1.,2.,4.]
+roofThickness=[0.5,1.,2.,4.]
+
+def replicateParams(para,parb,parc,Nrep):
+	parc=repeat(parc,Nrep)
+	b,a,c=meshgrid(parb,para,parc)
+	a=a.flatten()
+	b=b.flatten()
+	c=c.flatten()
+	#plot(a,'.-');plot(b,'.-');plot(c,'.-')
+	return a,b,c
+
+def placeReplicas(Nx,Ny,Dx,Dy,direction=1):
+	if direction==0:
+		a,b=meshgrid(arange(0,Nx)*Dx,arange(0,Ny)*Dy)
+	elif direction==1:
+		b,a=meshgrid(arange(0,Ny)*Dy,arange(0,Nx)*Dx)
+	xs=list(flatten(a))
+	ys=list(flatten(b))
+	#plot(xs,ys, 'x')
+	return xs,ys
+
+
+xs,ys=placeReplicas(Nx,Ny,Dx,Dy)
+gateDepths,wallThicknesses,roofThicknesses=replicateParams(gateDepths,wallThicknesses,roofThicknesses,Nrep)
+
+for i in range(Nx*Ny):
+	trap=makeThickTrap(widths[i],depths[i],gateWidths[i],gateDepth,wallThickness,roofThickness,speed)
+	#trap=makeSimpleTrap(widths[i],depths[i],gateWidths[i],extraRoof,speed)
+	#trap=makeSimpleTrap2(widths[i],depths[i],gateWidths[i],extraRoof,speed)
+	if traps is None:
+		traps=deepcopy(trap)
+	else:
+		trap.shift([xs[i],ys[i],0.])
+		traps.addStr(trap)
+	#print str(float(i)/(Nx*Ny)*100)[:4]+' %\n'
+	i+=1
+
+
+traps.plot(1)
+figure(); traps.plot2D([0,1])
+figure(); traps.plot2D([0,2])
+figure(); traps.plot2D([1,2])
+show()
+
+t=holo.trap(10.,10.,0.)
+h=holo.holo(t)
+slm.show(h)
+

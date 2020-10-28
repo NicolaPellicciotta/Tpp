@@ -1,0 +1,117 @@
+import world
+import microstructure as mStr
+import piezotools as piTools
+PiezoDynamics=piTools.PiezoDynamics
+import tweezers as holo
+#import slm
+from numpy import *
+import time
+from mayavi import mlab as mayalab
+from copy import deepcopy
+from lasersign import *
+#if world.slm is None:
+#    slm=slm.Modulator()
+
+def shutter():
+    piTools.do_const(1,1)
+    piTools.do_const(0,1)
+
+def resetPos():
+    piTools.ao_const([0,0,0],[0,1,2])
+        
+
+class TwoPhotonPoly():
+    def __init__(self):
+        self.LPF_freqs=[65,65,160]
+        self.LPF_orders=[8,8,24]
+        self.piDyn=piTools.loadMeas("/home/roberto/Documents/Dev/Python/tpp/piezoDynamics")
+
+    def polymerizeMulti(self,ustr,xyBlockNs,xyBlockDist):
+        Nblocks=array(xyBlockNs).prod()
+        bi=0.
+        for xi in range(xyBlockNs[0]):
+            bstr=deepcopy(ustr)
+            bstr.shift([xyBlockDist[0]*xi,0,0])
+            for yi in range(xyBlockNs[1]):
+                self.polymerize(bstr,)
+                bstr.shift([0,xyBlockDist[1],0])
+                bi+=1
+                print "block " + str(xi) + "x " + str(yi) + "y finished, " + str(bi/Nblocks*100.) + "% complete"
+
+    
+    def polymerize(self,ustr,readpos=False):
+    
+        #get the current piezo position averaged:
+        vpos0=piTools.ai_waveform(0.0001,1000,chan=[0,1,2],rng=0).mean(0)
+        
+        if readpos:
+            #array for the positions read during the scan:
+            posread=array([[],[],[]]).transpose()
+            #array for the deviations from the structure coordinates:
+            scndev=array([])
+
+        for i in arange(len(ustr.Strokes)):
+            si=ustr.Strokes[i]
+
+            #get the interpolated coordinates of the current stroke:
+            icoors,dt=si.icoors() 
+            vout=icoors/30.   
+            vout[:,2]=-vout[:,2]   #PIEZO Z-axis is upside down
+
+            #array for the precompensated voltages:
+            vout_c=zeros_like(vout)
+
+            #send the piezo to the start position of the Stroke            
+            piTools.ao_const(vout[0,:],[0,1,2])
+          
+            #precompensate for the piezo dynamics:
+            for ci in range(3):
+                vout_c[:,ci]=piTools.precompensate(vout[:,ci],dt,self.piDyn.Tf_fits[ci],self.LPF_freqs[ci],self.LPF_orders[ci])
+
+            #check that the precompensated voltages are within the range of the piezo (0,10):
+            if ((vout_c+vpos0).max()>10) or ((vout_c+vpos0).min()<0):
+                print "SCAN COORDINATES OUT OF RANGE FOR STROKE " + str(i).upper() + "!!!"
+                return -1
+
+
+            if si.holo is not None:
+                slm.show(si.holo)
+#            time.sleep(0.5)
+            time.sleep(0.15)
+
+            #(open shutter):               
+            shutter()
+
+            #do the scan:            
+            vread=piTools.aio_waveform(si.dt,vout_c,chan=[0,1,2],rng_in=0,rng_out=0)
+            
+            #(close shutter):               
+            shutter()
+            
+            if readpos:
+                pr=(vread-vpos0)*30.
+                pr[:,2]*=-1     #PIEZO Z-axis is upside down   
+                scndev=append(scndev,sqrt(sum((pr-icoors)**2,axis=1)))
+                posread=append(posread,pr,axis=0)
+
+        #go back to zero position
+        resetPos()
+
+        if readpos==0:
+            return
+        
+        ustr.plot(markerscalef=0.02)
+        mayalab.plot3d(posread[:,0],posread[:,1],posread[:,2],scndev*1000,colormap="blue-red",
+                    tube_radius=None,line_width=1.5)
+#                scale_factor=0.05,colormap="blue-red",scale_mode='none')        
+        mayalab.colorbar(nb_labels=5,orientation='vertical') 
+
+        print('max dev:' +str(scndev.max()*1000) + 'nm')    
+        print('std-dev:' +str(std(scndev)*1000) + 'nm')   
+           
+        return posread
+
+
+
+
+
