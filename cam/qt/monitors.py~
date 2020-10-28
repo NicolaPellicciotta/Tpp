@@ -1,0 +1,304 @@
+from PyQt4 import QtCore, QtGui
+from PyQt4.Qwt5 import *
+from hololab.cam.plotting import *
+from numpy import histogram
+import time
+from hololab import world
+
+app=Qt.QCoreApplication.instance()
+axiscol=QtGui.QColor(120,100,120)
+font=QtGui.QFont("Droid Sans", pointSize=10) 
+
+class MonitorPlot(QwtPlot):
+  def __init__(self, parent=None): 
+    super(MonitorPlot, self).__init__(parent)
+    self.setCanvasBackground(QtCore.Qt.black)
+    self.setCanvasLineWidth(0)
+    self.setMargin(10)
+
+    picker=MonitorPicker(self)
+
+    self.zoomer = Qwt.QwtPlotZoomer(Qwt.QwtPlot.xBottom,
+                               Qwt.QwtPlot.yLeft,
+                               Qwt.QwtPicker.DragSelection,
+                               Qwt.QwtPicker.AlwaysOff,
+                               self.canvas())
+    pen=QtGui.QPen(Qt.Qt.red)
+    pen.setWidth(2)
+    self.zoomer.setRubberBandPen(pen)
+
+    self.setAxisFont(Qwt.QwtPlot.xBottom, font) 
+    self.setAxisFont(Qwt.QwtPlot.yLeft, font) 
+
+  def minimumSizeHint(self):
+    return QtCore.QSize(200,80)
+
+class MonitorCurve(QwtPlotCurve):
+  linecol=QtGui.QColor(100,255,0,150)
+  def __init__(self): 
+    super(MonitorCurve, self).__init__()
+    self.pen=QtGui.QPen()
+    self.pen.setColor(self.linecol)
+    self.pen.setWidth(2)
+    self.setPen(self.pen)
+    self.setRenderHint(QwtPlotItem.RenderAntialiased)
+ 
+class MonitorPicker(Qwt.QwtPlotPicker):
+  def __init__(self, plot):
+    super(MonitorPicker, self).__init__(Qwt.QwtPlot.xBottom,
+                               Qwt.QwtPlot.yLeft,
+                               Qwt.QwtPicker.NoSelection,
+                               Qwt.QwtPlotPicker.CrossRubberBand,
+                               Qwt.QwtPicker.AlwaysOn,
+                               plot.canvas())
+    self.setTrackerPen(Qt.QPen(Qt.Qt.red))
+    self.plot=plot
+
+  def trackerText(self, pos):   
+    x=self.plot.invTransform(Qwt.QwtPlot.xBottom, pos.x())
+    y=self.plot.invTransform(Qwt.QwtPlot.yLeft, pos.y())
+    return QwtText("%d,%d" % (round(x), round(y))) 
+
+class monitor(QtGui.QWidget):
+
+  def __init__(self, roi): 
+    super(monitor, self).__init__()
+   
+    self.roi=roi
+
+    palette=QtGui.QPalette()
+    palette.setColor(QtGui.QPalette.Text, axiscol)
+    palette.setColor(QtGui.QPalette.WindowText, axiscol)
+    palette.setColor(QtGui.QPalette.Background, QtCore.Qt.black)
+    self.setPalette(palette)
+
+    self.setFont(font)
+
+    #self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+    #if world.ccd and world.ccd.gcr():
+    #  self.attach(world.ccd.gcr())
+    self.attach()
+    self.show()
+    
+  def attach(self):
+    self.roi.signals.refreshed.connect(self.update)
+
+  def detach(self):
+    self.roi.signals.refreshed.disconnect(self.update)
+
+  def closeEvent(self, event):
+    self.detach()
+    super(monitor, self).closeEvent(event)
+
+class xysum(monitor):
+  def __init__(self, roi=None):
+    super(xysum, self).__init__(roi)
+    layout=QtGui.QVBoxLayout()
+    
+    fig=MonitorPlot(self)
+    self.xsum=MonitorCurve()
+    self.xsum.attach(fig)
+    layout.addWidget(fig)
+    #fig.setTitle("horizontal slice")
+    fig.setAxisTitle(Qwt.QwtPlot.xBottom, "x (column index)")
+    self.xfig=fig
+
+
+    fig=MonitorPlot(self)
+    self.ysum=MonitorCurve()
+    self.ysum.attach(fig)
+    layout.addWidget(fig)
+    #fig.setTitle("vertical slice")
+    fig.setAxisTitle(Qwt.QwtPlot.xBottom, "y (row index)")
+    self.yfig=fig
+     
+    self.xfig.show()
+    self.setLayout(layout)
+    self.setWindowTitle("XY-Sum")
+    self.show()
+
+    #self.xrange=[1e10,0]
+    #self.yrange=[1e10,0]
+
+  def sizeHint(self):
+    return QtCore.QSize(500,400)
+
+  def update(self):
+    origin=self.roi.origin
+    data=self.roi.data
+    xdata=data.mean(0)
+    ydata=data.mean(1)
+
+    #update plot yaxis limits
+    #if min(xdata)<self.xrange[0]:
+    #  self.xrange[0]=min(xdata)
+    #if max(xdata)>self.xrange[1]:
+    #  self.xrange[1]=max(xdata)
+    #if min(ydata)<self.yrange[0]:
+    #  self.yrange[0]=min(ydata)
+    #if max(ydata)>self.yrange[1]:
+    #  self.yrange[1]=max(ydata)
+     #self.c.setData(arange(data.shape[1]), data.mean(0))
+    self.xsum.setData(arange(data.shape[1]), xdata)
+    self.ysum.setData(arange(data.shape[0]), ydata)
+    self.xfig.zoomer.setZoomBase(QtCore.QRectF(0,min(xdata), len(xdata), max(xdata)-min(xdata)))
+    self.yfig.zoomer.setZoomBase(QtCore.QRectF(0,min(ydata), len(ydata), max(ydata)-min(ydata)))
+    self.xfig.replot()
+    self.yfig.replot()
+
+
+class xyslice(monitor):
+  def __init__(self, roi=None):
+    super(xyslice, self).__init__(roi)
+    layout=QtGui.QVBoxLayout()
+    
+    fig=MonitorPlot(self)
+    self.xslice=MonitorCurve()
+    self.xslice.attach(fig)
+    layout.addWidget(fig)
+    #fig.setTitle("horizontal slice")
+    fig.setAxisTitle(Qwt.QwtPlot.xBottom, "x (column index)")
+    self.xfig=fig
+
+
+    fig=MonitorPlot(self)
+    self.yslice=MonitorCurve()
+    self.yslice.attach(fig)
+    layout.addWidget(fig)
+    #fig.setTitle("vertical slice")
+    fig.setAxisTitle(Qwt.QwtPlot.xBottom, "y (row index)")
+    self.yfig=fig
+     
+    self.xfig.show()
+    self.setLayout(layout)
+    self.setWindowTitle("XY-Slice")
+    self.show()
+
+    #self.xrange=[1e10,0]
+    #self.yrange=[1e10,0]
+
+  def sizeHint(self):
+    return QtCore.QSize(500,400)
+
+  def update(self):
+    origin=self.roi.origin
+    data=self.roi.data
+    xdata=data[origin.y()]
+    ydata=data[:,origin.x()]
+
+    #update plot yaxis limits
+    #if min(xdata)<self.xrange[0]:
+    #  self.xrange[0]=min(xdata)
+    #if max(xdata)>self.xrange[1]:
+    #  self.xrange[1]=max(xdata)
+    #if min(ydata)<self.yrange[0]:
+    #  self.yrange[0]=min(ydata)
+    #if max(ydata)>self.yrange[1]:
+    #  self.yrange[1]=max(ydata)
+     #self.c.setData(arange(data.shape[1]), data.mean(0))
+    self.xslice.setData(arange(data.shape[1]), xdata)
+    self.yslice.setData(arange(data.shape[0]), ydata)
+    self.xfig.zoomer.setZoomBase(QtCore.QRectF(0,min(xdata), len(xdata), max(xdata)-min(xdata)))
+    self.yfig.zoomer.setZoomBase(QtCore.QRectF(0,min(ydata), len(ydata), max(ydata)-min(ydata)))
+    self.xfig.replot()
+    self.yfig.replot()
+
+class peakmonitor(monitor):
+  def __init__(self, roi=None):
+    super(peakmonitor, self).__init__(roi)
+
+    self.maxval=0
+    layout=QtGui.QVBoxLayout()
+    
+    self.fig=MonitorPlot(self)
+    self.current=MonitorCurve()
+    self.maxcurve=MonitorCurve()
+    self.maxcurve.pen.setColor(QtGui.QColor(255,0,0,100))
+    self.maxcurve.setPen(self.maxcurve.pen)
+    self.current.attach(self.fig)
+    self.maxcurve.attach(self.fig)
+    layout.addWidget(self.fig)
+     
+    #self.xfig.show()
+    self.setLayout(layout)
+    self.show()
+
+  def sizeHint(self):
+    return QtCore.QSize(500,400)
+
+  def update(self):
+    data=self.roi.data
+    x=arange(data.shape[1])
+    y=data.mean(0)
+    self.current.setData(x,y)
+    
+    if max(y)>self.maxval:
+      self.maxval=max(y)
+      self.maxcurve.setData(x,y)
+    self.fig.replot()
+
+class levels(monitor):
+  def __init__(self, roi=None):
+    super(levels, self).__init__(roi)
+
+    layout=QtGui.QVBoxLayout()
+    
+    self.fig=MonitorPlot(self)
+    self.histo=MonitorCurve()
+    self.histo.attach(self.fig)
+    layout.addWidget(self.fig)
+     
+    #self.xfig.show()
+    self.setLayout(layout)
+    self.show()
+
+  def sizeHint(self):
+    return QtCore.QSize(500,400)
+
+  def update(self):
+    data=self.roi.data
+    [hy,be]=histogram(data,range=[0,4096], bins=256)
+    hx=(be[:-1]+be[1:])/2
+    self.histo.setData(hx,hy)
+    self.fig.replot()
+
+
+class qwtimgmonitor:
+  
+  axiscol=QtGui.QColor(80,80,80)
+  linecol=QtGui.QColor(100,255,0,150)
+  def __init__(self):
+    self.fig=QwtPlot()
+    self.fig.resize(400,400)
+    self.c=PlotImage() 
+    self.c.attach(self.fig)
+    self.fig.setCanvasBackground(QtCore.Qt.black)
+    self.fig.setCanvasLineWidth(0)
+    self.fig.setMargin(20)
+    #self.fig.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+    palette=QtGui.QPalette()
+    palette.setColor(QtGui.QPalette.Text, self.axiscol)
+    palette.setColor(QtGui.QPalette.WindowText, self.axiscol)
+    palette.setColor(QtGui.QPalette.Background, QtCore.Qt.black)
+    self.fig.setPalette(palette)
+
+    self.picker = QwtPlotPicker(
+      QwtPlot.xBottom,
+      QwtPlot.yLeft,
+      QwtPicker.PointSelection | QwtPicker.DragSelection,
+      QwtPlotPicker.CrossRubberBand,
+      QwtPicker.AlwaysOn,
+      self.fig.canvas())
+    self.picker.setRubberBandPen(QtGui.QPen(self.linecol))
+    self.picker.setTrackerPen(QtGui.QPen(self.axiscol, 2))
+
+
+
+    self.fig.show()
+
+  def update(self, data):
+    self.c.setData(data)
+    self.fig.replot()
+
+
+

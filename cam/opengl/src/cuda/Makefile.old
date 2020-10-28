@@ -1,0 +1,26 @@
+CUDA_COMMON_IDIR=/home/roberto/NVIDIA_GPU_Computing_SDK/C/common/inc
+FLAGS=-Xcompiler -fPIC
+
+libcudacam.so: common/common.o render/render.o histogram/histogram64.o histogram/histogram.o
+	nvcc common/common.o render/render.o histogram/histogram.o histogram/histogram64.o -shared $(FLAGS) -o libcudacam.so
+
+common/common.o:  common/common.cu
+	nvcc common/common.cu -c $(FLAGS) -o common/common.o
+
+
+render/render.o:  render/render.cu
+	nvcc render/render.cu -c $(FLAGS) -o render/render.o
+
+
+histogram/histogram64.o: histogram/histogram64.cu histogram/histogram_common.h
+	nvcc histogram/histogram64.cu -c $(FLAGS) -I$(CUDA_COMMON_IDIR) -o histogram/histogram64.o
+
+
+histogram/histogram.o: histogram/histogram.cpp histogram/histogram_common.h
+	nvcc histogram/histogram.cpp -c $(FLAGS) -I$(CUDA_COMMON_IDIR) -o histogram/histogram.o
+
+install:
+	cp libcudacam.so /usr/lib
+
+clean:
+	rm render/*.o histogram/*.o

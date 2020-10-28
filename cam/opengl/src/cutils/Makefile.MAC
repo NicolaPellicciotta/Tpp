@@ -1,0 +1,9 @@
+OPTS = -Wall -O2
+FLAGS=-Xcompiler -fPIC -m64
+
+
+libcutils.dylib: libcutils.c
+	gcc -shared $(FLAGS) libcutils.c -o libcutils.dylib
+
+install: libcutils.dylib
+	cp libcutils.dylib /usr/lib/

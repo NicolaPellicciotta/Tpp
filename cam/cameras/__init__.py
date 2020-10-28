@@ -1,0 +1,246 @@
+import ctypes
+from numpy import *
+import time
+import atexit
+from cam.frames import *
+import world
+import siteconf
+
+if siteconf.camera=="orca":
+  libcam=ctypes.cdll.LoadLibrary('liborca.so')
+elif siteconf.camera=="basler":
+  libcam=ctypes.cdll.LoadLibrary('libpylongige.so')
+elif siteconf.camera=="avt_gige":
+  libcam=ctypes.cdll.LoadLibrary('libavtgige.so')
+elif siteconf.camera=="mikrotron":
+  libcam=ctypes.cdll.LoadLibrary('libmikrotron.so')
+
+libcam.cam_get_shutter.restype=ctypes.c_int
+libcam.cam_get_roi.restype=ctypes.c_int
+libcam.cam_get_shape.restype=ctypes.c_int
+libcam.cam_get_format.restype=ctypes.c_int
+libcam.cam_streaming.restype=ctypes.c_int
+libcam.cam_snap.restype=ctypes.c_int
+libcam.cam_snap.argtypes=[ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
+libcam.cam_capture.restype=ctypes.c_int
+libcam.cam_capture.argtypes=[ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
+libcam.cam_stream.restype=ctypes.c_int
+libcam.cam_stream.argtypes=[ctypes.c_int, ctypes.c_char_p]
+
+ErrMsg=ctypes.create_string_buffer(256)
+
+class CamError(Exception):
+  """Raised when a libcam function returns with an error status
+
+  Attributes:
+    fname -- function name
+  """
+  def __init__(self, msg, code=None):
+    self.msg=msg.value
+    self.code=code
+  def __str__(self):
+    if not self.code:
+      return self.msg
+    else:
+      return self.msg+" code: %d" % self.code
+
+#Clean up 
+def cleanup():
+ if world.camera is not None:
+   world.camera.__del__()
+
+#atexit.register(cleanup)
+
+#======================================
+#   BaseCam class
+#======================================
+class BaseCam:
+  empty=array([], uint8)
+  def __init__(self):
+    if(libcam.cam_init(ErrMsg)):
+      raise CamError(ErrMsg)
+    self.open()
+    [w,h]=self.shape()
+    self.roi([0,0,w,h])
+    world.camera=self
+
+  def __del__(self):
+    print "Closing camera...."
+    if libcam.cam_close(ErrMsg):
+        raise CamError(ErrMsg)
+    libcam.cam_end()
+    world.camera=None
+
+  def shutter(self,val=None):
+    if self.isstreaming():
+      ErrMsg.value="Cannot set cam attributes while streaming"
+      raise CamError(ErrMsg)
+
+    if val!=None:
+      cval=ctypes.c_double(val)
+      if libcam.cam_set_shutter(cval, ErrMsg):
+        raise CamError(ErrMsg)
+      return None
+
+    else:
+      cval=ctypes.c_double()
+      if libcam.cam_get_shutter(ctypes.byref(cval), ErrMsg):
+        raise CamError(ErrMsg)
+      return cval.value
+
+  def framerate(self,val=None):
+    if self.isstreaming():
+      ErrMsg.value="Cannot set cam attributes while streaming"
+      raise CamError(ErrMsg)
+
+    if val!=None:
+      cval=ctypes.c_double(val)
+      if libcam.cam_set_framerate(cval, ErrMsg):
+        raise CamError(ErrMsg)
+      return None
+
+    else:
+      cval=ctypes.c_double()
+      if libcam.cam_get_framerate(ctypes.byref(cval), ErrMsg):
+        raise CamError(ErrMsg)
+      return cval.value
+
+
+  def gain(self,val=None):
+    if self.isstreaming():
+      ErrMsg.value="Cannot set cam attributes while streaming"
+      raise CamError(ErrMsg)
+
+    if val!=None:
+      cval=ctypes.c_int(val)
+      if libcam.cam_set_gain(cval, ErrMsg):
+        raise CamError(ErrMsg)
+
+    else:
+      cval=ctypes.c_int()
+      if libcam.cam_get_gain(ctypes.byref(cval), ErrMsg):
+        raise CamError(ErrMsg)
+      return cval.value
+
+  def cps(self):
+    cval=ctypes.c_double()
+    libcam.cam_get_clocks_per_sec(ctypes.byref(cval), ErrMsg)  
+    return cval.value
+
+  def mpp(self):
+    cval=ctypes.c_double()
+    libcam. cam_get_micron_per_pixel(ctypes.byref(cval), ErrMsg)  
+    return cval.value
+
+  def roi(self,val=None):
+    if val!=None:
+      if self.isstreaming():
+        ErrMsg.value="Cannot set cam attributes while streaming"
+        raise CamError(ErrMsg)
+
+      [left,top,w,h]=val
+      cleft=ctypes.c_int(left)
+      ctop=ctypes.c_int(top)
+      cw=ctypes.c_int(w)
+      ch=ctypes.c_int(h)
+      if libcam.cam_set_roi(cleft,ctop,cw,ch, ErrMsg):
+        raise CamError(ErrMsg)
+
+    else:
+      [cleft,ctop,cwidth,cheight]=[ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_int()]
+      libcam.cam_get_roi(ctypes.byref(cleft), ctypes.byref(ctop), ctypes.byref(cwidth), ctypes.byref(cheight))
+      return [cleft.value, ctop.value, cwidth.value, cheight.value]
+
+  def shape(self):
+    [cwidth,cheight]=[ctypes.c_int(), ctypes.c_int()]
+    libcam.cam_get_shape(ctypes.byref(cwidth), ctypes.byref(cheight))
+    return [cwidth.value, cheight.value]
+
+  def dtype(self):
+    format=ctypes.create_string_buffer(8)
+    libcam.cam_get_format(format, ErrMsg)
+    if format.value in ["MONO8", "RGB8"]:
+      return uint8
+    elif format.value in ["MONO12"]:
+      return uint16
+
+  def format(self, val=None):
+    if val!=None:
+      formatstr=ctypes.create_string_buffer(val,16)
+      if libcam.cam_set_format(formatstr, ErrMsg):
+        raise CamError(ErrMsg)
+    else:
+      formatstr=ctypes.create_string_buffer(16)
+      libcam.cam_get_format(formatstr, ErrMsg)
+      return formatstr.value
+
+  def isstreaming(self):
+    val=ctypes.c_int()
+    libcam.cam_streaming(ctypes.byref(val), ErrMsg)
+    return val.value
+
+  def roi_size(self):
+    [x,y,w,h]=self.roi()
+    return w*h
+    
+  def snap(self, bufp=None):
+    RETURNS=False
+    if self.isstreaming():
+      ErrMsg.value="Cannot snap while streaming"
+      raise CamError(ErrMsg)
+
+    if bufp==None:
+      RETURNS=True
+      roi=self.roi()
+      origin=roi[:2]
+      [w,h]=roi[2:]
+      buf=zeros((h,w), dtype=self.dtype())
+      bufp=buf.ctypes.data
+
+    timestamp=ctypes.c_uint32()
+    status=libcam.cam_snap(bufp, ctypes.byref(timestamp), ErrMsg)
+
+    if RETURNS:
+      if status==0:
+        return frame(buf, timestamp.value, origin)
+      else:
+        return frame(self.empty, timestamp.value, origin, status)
+
+  def capture(self, bufp=None):
+    if not self.isstreaming():
+      ErrMsg.value="Cannot capture, stream inactive"
+      raise CamError(ErrMsg)
+
+    RETURNS=False
+    if bufp==None:
+      RETURNS=True
+      roi=self.roi()
+      origin=roi[:2]
+      [w,h]=roi[2:]
+      buf=zeros((h,w), dtype=self.dtype())
+      bufp=buf.ctypes.data
+
+    timestamp=ctypes.c_uint32()
+    status=libcam.cam_capture(bufp, ctypes.byref(timestamp), ErrMsg)
+
+    if RETURNS:
+      if status==0:
+        return frame(buf, timestamp.value, origin)
+      else:
+        return frame(self.empty, timestamp.value, origin, status)
+
+  def stream(self, trig=0):
+    if libcam.cam_stream(ctypes.c_int(trig), ErrMsg):
+      raise CamError(ErrMsg)
+
+  def stop(self):
+    if libcam.cam_stop(ErrMsg):
+      raise CamError(ErrMsg)
+
+  def open(self):
+    if libcam.cam_open(ErrMsg):
+      raise CamError(ErrMsg)
+
+  def close(self):
+    if libcam.cam_close(ErrMsg):
+      raise CamError(ErrMsg)

@@ -1,0 +1,494 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <pylon/PylonIncludes.h>
+using namespace Pylon;
+
+#if defined( USE_1394 )
+// Settings to use  Basler 1394 cameras
+#include <pylon/1394/Basler1394Camera.h>
+typedef Pylon::CBasler1394Camera Camera_t;
+using namespace Basler_IIDC1394CameraParams;
+using namespace Basler_IIDC1394StreamParams;
+#elif defined ( USE_GIGE )
+// Settings to use Basler GigE cameras
+#include <pylon/gige/BaslerGigECamera.h>
+typedef Pylon::CBaslerGigECamera Camera_t;
+using namespace Basler_GigECameraParams;
+using namespace Basler_GigEStreamParams;
+
+#else
+#error Camera type is not specified. For example, define USE_GIGE for using GigE cameras
+#endif
+
+#define DLLEXPORT extern "C"
+#define ERROR(msg, retval) strcpy(ErrMsg, msg); return retval;
+#define HEIGHT 1024
+#define WIDTH 1024
+#define PACKETSIZE 16000
+#define INTRPACKETDELAY 3500
+
+
+IPylonDevice* pDevice;
+IStreamGrabber* pGrabber;
+Camera_t Camera;
+Camera_t::StreamGrabber_t StreamGrabber;
+IChunkParser* pChunkParser_g;
+int ImageSize_g;
+
+int roi_left=0, roi_top=0, roi_width=WIDTH, roi_height=HEIGHT; 
+int STREAMING=0;
+int CHUNKSIZE;
+StreamBufferHandle hBufferA;
+StreamBufferHandle hBufferB;
+StreamBufferHandle *nextFrame;
+StreamBufferHandle *pendingFrame;
+char *ImageBuffer8A;
+char *ImageBuffer8B;
+unsigned short int *ImageBuffer12A;
+unsigned short int *ImageBuffer12B;
+
+DLLEXPORT int cam_init(char *ErrMsg)
+{
+    Pylon::PylonInitialize();
+    try
+    {
+        // Get the transport layer
+        CTlFactory& TlFactory = CTlFactory::GetInstance();
+        ITransportLayer *pTl = TlFactory.CreateTl(Camera_t::DeviceClass());
+        if (! pTl) {ERROR("Failed to create transport layer!",1)}
+
+        // Get all attached cameras and exit the application if no camera is found
+        DeviceInfoList_t devices;
+        if (0 == pTl->EnumerateDevices(devices)) {ERROR("No camera present!",1)}  
+
+        // Create device and attach to camera object
+        pDevice = pTl->CreateDevice( devices[0] );  
+        Camera.Attach(pDevice);
+        Camera.Open();
+
+        // Get and open the first stream grabber      
+        pGrabber = Camera.GetStreamGrabber(0);
+        StreamGrabber.Attach(pGrabber);
+        StreamGrabber.Open();
+
+        // Disable automatic X and Y centering
+        Camera.CenterX.SetValue(false);
+        Camera.CenterY.SetValue(false);
+
+        //initialize camera paramentes
+        Camera.OffsetX.SetValue(0);
+        Camera.OffsetY.SetValue(0);
+        Camera.Width.SetValue(WIDTH);//WARNING: DO NOT USE Camera.Width.GetMax()
+        Camera.Height.SetValue(HEIGHT);//WARNING: DO NOT USE Camera.Height.GetMax()
+	      Camera.GevSCPSPacketSize.SetValue(PACKETSIZE);
+        Camera.GevSCPD.SetValue(INTRPACKETDELAY);
+        Camera.GevSCFTD.SetValue(0);//interframe delay is set to 0 is only a camera is used
+
+        //Disable acquisition start and frame start trigger if available and configure frame start trig
+        Camera.TriggerSelector.SetValue( TriggerSelector_AcquisitionStart);
+        Camera.TriggerMode.SetValue( TriggerMode_Off);
+        Camera.TriggerSelector.SetValue( TriggerSelector_FrameStart);
+        Camera.TriggerMode.SetValue( TriggerMode_Off);
+        Camera.TriggerSource.SetValue( TriggerSource_Line1);
+        Camera.TriggerActivation.SetValue( TriggerActivation_RisingEdge );
+
+        //enable chunks (timestamps ecc.....)
+        Camera.ChunkModeActive.SetValue(true);
+        Camera.ChunkSelector.SetValue( ChunkSelector_Timestamp );
+        Camera.ChunkEnable.SetValue( true );
+
+        //Create image buffers, formats different from mono8 may be not present
+        Camera.PixelFormat.SetValue(PixelFormat_Mono8);
+        const int ImageSize8 = (int)(Camera.PayloadSize.GetValue());
+        ImageBuffer8A= (char *)malloc(ImageSize8);
+        ImageBuffer8B= (char *)malloc(ImageSize8);
+        CHUNKSIZE=ImageSize8-HEIGHT*WIDTH;
+
+        //check for 12 bit formats. If not present ImageBuffer12 are allocated anyway
+        try {Camera.PixelFormat.SetValue(PixelFormat_Mono12);}
+        catch (GenICam::GenericException &ee){}
+        try {Camera.PixelFormat.SetValue(PixelFormat_BayerGB12);}
+        catch (GenICam::GenericException &ee){}
+        const int ImageSize12 = (int)(Camera.PayloadSize.GetValue());
+        ImageBuffer12A= (unsigned short int *)malloc(ImageSize12);
+        ImageBuffer12B= (unsigned short int *)malloc(ImageSize12);
+        Camera.PixelFormat.SetValue(PixelFormat_Mono8);//reset pixel format to mono8
+
+        //close camera
+        StreamGrabber.Close();
+        Camera.Close();
+    }
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+
+    return 0;
+}
+
+DLLEXPORT int cam_open(char *ErrMsg)
+{
+    try
+    {Camera.Open();}
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+     return 0;
+}
+
+DLLEXPORT int cam_close(char *ErrMsg)
+{
+    try
+    {Camera.Close();}
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+    return 0;
+}
+
+DLLEXPORT int cam_end(void)
+{
+    free(ImageBuffer8A);
+    free(ImageBuffer8B);
+    free(ImageBuffer12A);
+    free(ImageBuffer12B);
+    Pylon::PylonTerminate();
+    return 0;
+}
+
+DLLEXPORT int cam_snap(char *buf,unsigned int *timestamp,char *ErrMsg)
+{
+    try
+    {
+        //open stream grabber
+        StreamGrabber.Open();
+
+        //set camera parameters
+        Camera.AcquisitionMode.SetValue(AcquisitionMode_SingleFrame);
+        Camera.ExposureMode.SetValue(ExposureMode_Timed);
+
+        //set grabber parameters
+        const int ImageSize = (int)(Camera.PayloadSize.GetValue());
+        StreamGrabber.MaxBufferSize.SetValue(ImageSize);
+        StreamGrabber.MaxNumBuffer.SetValue(1);
+        StreamGrabber.PrepareGrab();
+
+        //regiseter buffer
+        if (Camera.PixelFormat.GetValue()==PixelFormat_Mono8 || Camera.PixelFormat.GetValue()==PixelFormat_BayerGB8)
+        {hBufferA = StreamGrabber.RegisterBuffer(ImageBuffer8A, ImageSize);}
+        else if (Camera.PixelFormat.GetValue()==PixelFormat_Mono12 || Camera.PixelFormat.GetValue()==PixelFormat_BayerGB12)
+        {hBufferA = StreamGrabber.RegisterBuffer(ImageBuffer12A, ImageSize);}
+        StreamGrabber.QueueBuffer(hBufferA, NULL);
+
+        //acquire
+        Camera.AcquisitionStart.Execute();
+
+        //timeout?
+        bool isInTime=StreamGrabber.GetWaitObject().Wait(3000);
+        if (!isInTime) {StreamGrabber.CancelGrab();}
+
+        //succeeded?
+        GrabResult Result;
+        StreamGrabber.RetrieveResult(Result);
+        if (Result.Succeeded()) {memcpy(buf,Result.Buffer(),ImageSize-CHUNKSIZE);}
+        
+        // Create ChunkParser
+        IChunkParser* pChunkParser = Camera.CreateChunkParser();
+        pChunkParser->AttachBuffer(Result.Buffer(), Result.GetPayloadSize());
+        *timestamp=(unsigned int)Camera.ChunkTimestamp.GetValue();
+        pChunkParser->DetachBuffer();
+        Camera.DestroyChunkParser(pChunkParser);
+
+        //finishing
+        Camera.AcquisitionStop.Execute();
+        StreamGrabber.DeregisterBuffer(hBufferA);
+        StreamGrabber.FinishGrab();
+        StreamGrabber.Close();
+
+        //raise exceprions
+        if (!isInTime) {ERROR("Timeout occurred!",1)}
+        if (!Result.Succeeded()) {ERROR("No image acquired!",1)}
+    }
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+ 
+    return 0;
+}
+
+DLLEXPORT int cam_stream(double fps, int external_trigger, char *ErrMsg)
+{
+    try
+    {
+        //open stream grabber
+        StreamGrabber.Open();
+        //Set acquisition mode
+        Camera.AcquisitionMode.SetValue(AcquisitionMode_Continuous);
+        Camera.ExposureMode.SetValue(ExposureMode_Timed);
+        if (external_trigger==1)
+        {
+            Camera.TriggerSelector.SetValue(TriggerSelector_FrameStart);
+            Camera.TriggerMode.SetValue(TriggerMode_On);
+        }
+        else
+        {
+            Camera.AcquisitionFrameRateEnable.SetValue(true);
+            Camera.AcquisitionFrameRateAbs.SetValue(fps);
+        }
+        //set grabber parameters
+        const int ImageSize = (int)(Camera.PayloadSize.GetValue());
+        StreamGrabber.MaxBufferSize.SetValue(ImageSize);
+        StreamGrabber.MaxNumBuffer.SetValue(2);
+        StreamGrabber.PrepareGrab();
+        if (Camera.PixelFormat.GetValue()==PixelFormat_Mono8 || Camera.PixelFormat.GetValue()==PixelFormat_BayerGB8)
+        {
+            hBufferA = StreamGrabber.RegisterBuffer(ImageBuffer8A, ImageSize);
+            hBufferB = StreamGrabber.RegisterBuffer(ImageBuffer8B, ImageSize);
+        }
+        else if (Camera.PixelFormat.GetValue()==PixelFormat_Mono12 || Camera.PixelFormat.GetValue()==PixelFormat_BayerGB12)
+        {
+            hBufferA = StreamGrabber.RegisterBuffer(ImageBuffer12A, ImageSize);
+            hBufferB = StreamGrabber.RegisterBuffer(ImageBuffer12B, ImageSize);
+        }
+    	  nextFrame=&hBufferA;
+        pendingFrame=&hBufferB;
+        StreamGrabber.QueueBuffer(hBufferA, NULL);
+        // Create ChunkParser
+        IChunkParser* pChunkParser = Camera.CreateChunkParser();
+        pChunkParser_g=pChunkParser;
+        //compute image size
+        ImageSize_g = (int)(Camera.PayloadSize.GetValue());
+        //acquire
+        Camera.AcquisitionStart.Execute();
+        STREAMING=1;
+    }
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+
+    return 0;
+}
+
+
+DLLEXPORT int cam_stop(char *ErrMsg)
+{
+    try
+    { 
+        //Destroy ChunkParser
+        IChunkParser* pChunkParser=pChunkParser_g;
+        pChunkParser->DetachBuffer();
+        Camera.DestroyChunkParser(pChunkParser);
+        //stop
+        StreamGrabber.CancelGrab();
+        //retrive last quequed frame
+        for (GrabResult r; StreamGrabber.RetrieveResult(r););
+        //stop and deregister
+        Camera.AcquisitionStop.Execute();
+        StreamGrabber.DeregisterBuffer(hBufferB);
+        StreamGrabber.DeregisterBuffer(hBufferA);
+        StreamGrabber.FinishGrab();
+        StreamGrabber.Close();
+        //set trigger mode
+        Camera.TriggerSelector.SetValue(TriggerSelector_FrameStart);
+        Camera.TriggerMode.SetValue(TriggerMode_Off);
+        STREAMING=0;
+    }
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+
+    return 0;
+}
+
+DLLEXPORT int cam_capture(char *buf,unsigned int *timestamp, char *ErrMsg)
+{
+    try
+    {
+        //timeout?
+        bool isInTime=StreamGrabber.GetWaitObject().Wait(3000);
+        if (!isInTime) {StreamGrabber.CancelGrab();}//LEVARE TUTTO
+
+        //retrive result
+        GrabResult Result;
+        StreamGrabber.RetrieveResult(Result);
+
+        //que next buffer and swap next and pending frame      
+        StreamGrabber.QueueBuffer(*pendingFrame, NULL);
+        StreamBufferHandle *tmp;
+        tmp=nextFrame;
+        nextFrame=pendingFrame;
+        pendingFrame=tmp;
+
+        //succeeded?
+        if (Result.Succeeded()) {memcpy(buf,Result.Buffer(),ImageSize_g-CHUNKSIZE);}
+        IChunkParser* pChunkParser=pChunkParser_g;
+        pChunkParser->AttachBuffer(Result.Buffer(), Result.GetPayloadSize());
+        *timestamp=(unsigned int)Camera.ChunkTimestamp.GetValue();
+
+        //raise exceprions
+        if (!isInTime) {ERROR("Timeout occurred!",1)}
+        if (!Result.Succeeded()) {ERROR("No image acquired!",1)}
+    }
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+
+    return 0;
+}
+
+DLLEXPORT int cam_get_shutter(double *val, char *ErrMsg)
+{
+    try
+    {*val=(double)Camera.ExposureTimeAbs.GetValue()/1e6;}
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+    return 0;
+}
+
+DLLEXPORT int cam_set_shutter(double val, char *ErrMsg)
+{
+    try
+    {Camera.ExposureTimeAbs.SetValue(val*1e6);}
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+    return 0;
+}
+
+DLLEXPORT int cam_get_gain(int *val, char *ErrMsg)
+{
+    try
+    {*val=Camera.GainRaw.GetValue();}
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+    return 0;
+}
+
+DLLEXPORT int cam_set_gain(int val, char *ErrMsg)
+{
+    try
+    {Camera.GainRaw.SetValue(val);}
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+    return 0;
+}
+
+DLLEXPORT int cam_get_roi(int *left,int *top,int *width,int *height,char *ErrMsg)
+{
+    try
+    {
+        *left=roi_left;//*left=Camera.OffsetX.GetValue();
+        *top=roi_top;//*top=Camera.OffsetY.GetValue();
+        *width=roi_width;//*width=Camera.Width.GetValue();
+        *height=roi_height;//*height=Camera.Height.GetValue();
+    }
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+    return 0;
+}
+
+DLLEXPORT int cam_set_roi(int left,int top,int width,int height,char *ErrMsg)
+{
+    try
+    {
+        if (height<128) {height=128;}
+        if (height>HEIGHT) {height=HEIGHT;}
+        if (width<128) {width=128;}
+        if (width>WIDTH) {width=WIDTH;}
+        height=(height/4)*4;
+        width=(width/4)*4;
+        top=(top/2)*2;
+        left=(left/2)*2;
+        if (top+height>HEIGHT) { top=HEIGHT-height;} 
+        if (left+width>WIDTH) { left=WIDTH-width;} 
+        Camera.OffsetY.SetValue(0);
+        Camera.OffsetX.SetValue(0);
+        Camera.Height.SetValue(height);
+        Camera.Width.SetValue(width);
+        Camera.OffsetY.SetValue(top);
+        Camera.OffsetX.SetValue(left);
+        //store roi data
+        roi_left=left;
+        roi_top=top;
+        roi_width=width;
+        roi_height=height;
+    }
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+    return 0;
+}
+
+DLLEXPORT int cam_get_format(char *formatstr,char *ErrMsg)
+{
+    try
+    {
+        int formatint=Camera.PixelFormat.GetValue();
+        if (formatint==PixelFormat_Mono8)
+        {strcpy(formatstr,"MONO8");}
+        else if (formatint==PixelFormat_Mono12)
+        {strcpy(formatstr,"MONO12");}
+        else if (formatint==PixelFormat_BayerGB8)
+        {strcpy(formatstr,"RGB8");}
+        else if (formatint==PixelFormat_BayerGB12)
+        {strcpy(formatstr,"RGB12");}
+        return 0;    
+    }
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+    return 0;
+}
+
+DLLEXPORT int cam_set_format(char *formatstr,char *ErrMsg)
+{
+    try
+    {
+        if (strncmp(formatstr,"MONO8",5)==0)
+        {Camera.PixelFormat.SetValue(PixelFormat_Mono8);}
+        else if (strncmp(formatstr,"MONO12",6)==0)
+        {Camera.PixelFormat.SetValue(PixelFormat_Mono12);}
+        else if (strncmp(formatstr,"RGB8",4)==0)
+        {Camera.PixelFormat.SetValue(PixelFormat_BayerGB8);}
+        else if (strncmp(formatstr,"RGB12",5)==0)
+        {Camera.PixelFormat.SetValue(PixelFormat_BayerGB12);}
+        else
+        {ERROR("Specified pixel format not available!",1)}
+        return 0;    
+    }
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+    return 0;
+}
+
+DLLEXPORT int cam_get_shape(int *width,int *height,char *ErrMsg)
+{
+    try
+    {
+        *width=WIDTH;
+        *height=HEIGHT;
+    }
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+    return 0;
+}
+
+DLLEXPORT int cam_get_clocks_per_sec(double *cps, char *ErrMsg)
+{
+    try
+    {*cps=(double)Camera.GevTimestampTickFrequency.GetValue();}
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+    return 0;
+}
+
+DLLEXPORT int cam_streaming(int *val, char *ErrMsg)
+{
+    *val=STREAMING;
+    return 0;
+}
+
+DLLEXPORT int cam_get_micron_per_pixel(double *val, char ErrMsg)
+{
+    *val=5.5;
+    return 0;
+}
+/*
+DLLEXPORT int cam_get_model(char *val, char *ErrMsg)
+{
+    try
+    {strcpy(val,Camera.GetDeviceInfo().GetModelName().c_str());}
+    catch (GenICam::GenericException &e)
+    {ERROR(e.GetDescription(),1)}
+    return 0;
+}
+*/
