@@ -1,0 +1,152 @@
+import os
+import cv2
+import cam
+#from PyQt4 import QtGui, QtCore
+import subprocess as sp
+import tempfile, os, shutil, sys
+import numpy as np
+import matplotlib.pyplot as plt
+
+def conv2uint8(im, vmin, vmax, invert=False):
+    if invert:
+        im8=255.*(vmax-im)/(vmax-vmin)
+    else:
+        im8=255.*(im-vmin)/(vmax-vmin)
+        
+    return im8.astype(np.uint8)
+
+def cropROI(roi, img):
+    #return a Region of interest from the image
+    X,Y,W,H=roi
+    return img[Y:(Y+H), X:(X+W)]
+
+def rescale2uint8(im, invert=False):
+    if invert:
+        im8=255.*(im.max()-im)/(im.max()-im.min())
+    else:
+        im8=255.*(im-im.min())/(im.max()-im.min())
+        
+    return im8.astype(np.uint8)
+
+def fig2Img(Fig):
+    canvas=Fig.canvas
+    w,h=canvas.get_width_height()
+    img = np.fromstring(canvas.tostring_rgb(), dtype='uint8').reshape(h, w, 3)
+    return img
+
+
+def frames2vid(stackname, output, speed=1., timeInterval=None, skip=None, roi=None, compression=18, vmin=None, vmax=None,fps=None):
+    s=cam.loadstack(stackname)
+    if fps is None:
+        fps=(1/np.diff(s.time())).mean()
+    if skip:
+        fps=fps/skip
+
+    fps=speed*fps
+    fps=int(fps)
+    print 'fps=%d'%fps
+
+    if output[-4:]=='.avi':
+        output=output[:-4]   
+
+    if timeInterval:
+        t0, t1=timeInterval
+    else:
+        t0=0; t1=len(s)
+    
+    if roi is None:
+        h,w=s[0].data.shape
+    else:
+        h=roi[3]
+        w=roi[2]
+
+    if vmin==None:
+        vmin=s[0].data.min()
+    if vmax==None:
+        vmax=s[0].data.max()
+    print vmin, vmax 
+
+    vid=Video(w, h, filename=output+'.avi', fps=fps, mode='MONO8', compression=compression)
+
+    for i in np.arange(t0, t1):
+        if not (skip==None or i%skip==0):
+            continue        
+        try:        
+            im=s[i].data.copy()
+        except KeyError:
+            im=s[i-1].data.copy()
+        if roi:
+            im=cropROI(roi, im)
+        if im.dtype != np.uint8:
+            im=conv2uint8(im, vmin=vmin, vmax=vmax)           
+        vid.append(im)
+    vid.close()            
+
+class Video:
+  def __init__(self, w, h, filename=None, mode='MONO8', fps=24, compression=10):
+
+    if mode=='RGB8':
+      nbits=w*h*24
+      pix_fmt='rgb24'
+    #All mono modes are converted to 8bit gray
+    elif mode in ['MONO8', 'MONO12', 'MONO16']:
+      nbits=w*h*8
+      pix_fmt='gray'
+
+    self.mode=mode
+
+    if filename is None:
+      self.filename=tempfile.mktemp(prefix="camvideo-")
+      self.RENAME=True
+    else:
+      self.filename=filename
+      self.RENAME=False
+
+    bitrate=nbits*fps/1.e3
+    bstr="%.0dk" % (bitrate/compression)
+    self.pipe=sp.Popen(['ffmpeg',
+      '-y',       #overwrite output file
+      '-s', '%dx%d' % (w, h),
+      '-f', 'rawvideo',
+      '-vcodec', 'rawvideo',
+      '-pix_fmt', pix_fmt,
+      '-r', '%d' % fps,
+      '-i', '-',  # stdin
+      '-an',      # no audio
+      '-vcodec', 'libx264', #mpeg4', 
+      '-pix_fmt', 'yuv420p', #seems to be a very common one
+      '-crf', str(compression),
+      '-threads','0', 
+      self.filename],
+      stdin=sp.PIPE, stdout=sys.stdout.fileno(), stderr=sys.stdout.fileno(),
+      universal_newlines=True)
+
+
+  def append(self, data):
+    if self.mode == 'MONO12':
+      data=(data/2**4).astype(np.uint8)
+    elif self.mode == 'MONO16':
+      data=(data/2**8).astype(np.uint8)
+
+    data.tofile(self.pipe.stdin)
+
+  def close(self):
+    self.pipe.stdin.close()
+    self.pipe.wait()
+    #if self.RENAME:
+    #  self.d=QtGui.QFileDialog()
+    #  self.d.fileSelected.connect(self.rename)
+    #  self.d.show()
+
+  def rename(self, filename):
+    shutil.move(self.filename, filename)
+
+  def log(self):
+    for line in self.pipe.stderr.readlines():
+      print line
+
+
+
+
+    
+

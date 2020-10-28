@@ -1,0 +1,40 @@
+from cam import *
+import cv2
+
+
+s=loadstack('triangle3.zip')
+bckgnd=load('triangle3.npy')
+
+
+im=s[8051].data-bckgnd
+im=im.astype(float32)
+
+
+
+def gaussTemp(fwhm=8, tsize=29)
+    '''
+    fwhm is the width of the template
+    tsize is the template size 
+    '''
+    #norm 2d corr:
+    xyvec=arange(tsize,dtype=float32)-tsize/2.+0.5
+    X,Y=meshgrid(xyvec,xyvec)
+    Rmat=sqrt(X**2+Y**2)
+    #gtemp=exp(-(4*log(2)*Rmat**2)/(fwhm**2)).astype(float32)
+    gtemp=(1./(1+(Rmat/(fwhm*0.5))**2)).astype(float32)
+    return gtemp
+
+def matchTemplate(gtemp):
+    cmat=cv2.matchTemplate(im,gtemp,cv2.TM_CCORR_NORMED)
+    cmat=pad(cmat,tsize/2,'constant')
+    cmat=(cmat-cmat.min())/cmat.ptp()
+    return cmat
+
+figure()
+imshow(im)
+
+figure()
+imshow(cmat)
+
+
+show()

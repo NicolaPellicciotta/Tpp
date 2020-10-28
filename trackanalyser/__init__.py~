@@ -1,0 +1,824 @@
+import imageCVanalyser as imCV
+import bactFunction as bfun
+import correct_times as cort
+import os
+import sys
+import gc
+import cPickle as pickle
+import utilities as util
+from cam import loadstack
+from matplotlib.mlab import *
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from numpy import *
+from PIL import Image, ImageDraw
+import makevideo as video
+
+import cv2
+from scipy.signal import wiener
+
+
+class Bacterium():
+    '''
+    -psi = orientation angle
+    -lam1 and lam2 are respectively the major eigenvalue and the minor eigenvalue
+    '''
+    def __init__(self,label,com,psi,lam,meanPixI,ellFit, t):
+        self.comment=None
+        self.label= str(label)
+        self.x=[]
+        self.y=[]
+        self.t=[]
+        self.psi=[]
+        self.lam1=[]
+        self.lam2=[]
+        self.meanPixI=[]
+        self.ellFit=[]
+        self.addCom2Trajectory(com,psi,lam,meanPixI,ellFit,t)
+
+    def addCom2Trajectory(self,com,psi,lam,meanPixI,ellFit,t):
+        self.x+=[com[0]]
+        self.y+=[com[1]]
+        self.t+=[t]
+        self.psi+=[psi]
+        self.lam1+=[lam[0]]
+        self.lam2+=[lam[1]]
+        self.meanPixI+=[meanPixI]
+        self.ellFit+=[ellFit]
+
+    def append(self,bact):
+        self.x=concatenate((self.x,bact.x))
+        self.y=concatenate((self.y,bact.y))
+        self.t=concatenate((self.t,bact.t))
+        self.psi+=bact.psi
+        self.lam1+=bact.lam1
+        self.lam2+=bact.lam2
+        self.meanPixI+=bact.meanPixI
+        self.ellFit+=bact.ellFit
+
+
+    def bactAnalysis(self, t):
+        self.calcVelocity(t)
+        self.calcMSD(t)
+
+
+    def calcVelocity(self, t, dt=0.5):
+        fps=1./diff(t)[diff(t)>0].mean()
+        self.x = array(self.x).astype(float32)
+        self.y = array(self.y).astype(float32)
+        self.t= array(self.t)
+        tb=t[self.t]
+
+        i1,i2=cort.diff_idxs(tb, dt, fps)
+        if not i1.any(): self.v=array([])
+        self.tv=(tb[i2]+tb[i1])/2.
+        difft=tb[i2]-tb[i1]
+        dx=(self.x[i2]-self.x[i1])
+        dy=(self.y[i2]-self.y[i1])
+        self.v=hypot(dx, dy)/difft
+
+        '''
+        dt=tBact[a:]-tBact[:-a]
+        dx=self.x[a:]-self.x[:-a]
+        dy=self.y[a:]-self.y[:-a]
+        vx=dx/dt
+        vy=dy/dt
+        self.v=hypot(vx, vy)
+        #self.th=arctan2(vy,vx)
+        '''
+
+    def calcMSD(self, t, bin_dt=0.1):
+        tb=t[self.t]
+        tmsd, bmsd=bfun.msd2d(tb, self.x, self.y, bin_dt=bin_dt)
+        self.tmsd=tmsd
+        self.msd=bmsd
+
+    def addComment(self, minTrajLen=20):
+        l=len(self.t)
+        if l <= minTrajLen:
+            self._setComment('tooshort')
+        else:
+            self._setComment('undefined')
+
+    def _setComment(self, comment):
+        setattr(self, 'comment', comment)
+
+    def bactFilter(self, comment_filter):
+        if comment_filter==None:
+            return True
+        elif not self.comment in comment_filter:
+            return False
+        return True
+
+
+
+
+
+class BactImageAnalyser():
+    def __init__(self):
+        self._setPtpThreshold(0)
+        self._setFilterSigma(0, 0)
+        self._setImageThreshold(0)
+        self._setMinTrajLen(0)
+        self._bgON=False
+        self._matchTemplateON=False
+        self._equalizeON=False
+        self.threshAreaMin=0
+        self._setEllipseAxisFilter()
+        self._col=['b','g','r','c','m','y']
+
+    ##########################################################
+    def loadstack(self, stack_path):
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+        self.path='./'+'/'.join(stack_path.split('/')[:-1])
+        self.stack_name=stack_path.split('/')[-1][:-4]
+        self.stack_path=stack_path
+        self.stack=loadstack(self.stack_path)
+        self._setTFrame(0)
+        self._setROI()
+        self.time=self.stack.time()
+        self.Nframes=len(self.time)
+        self.ptp=zeros(self.Nframes)
+        self._setTimeInterval()
+        dt=diff(self.time)
+        self.fps=1./dt[dt>0].mean()
+
+    def getCurrentFrame(self):
+        im=self.stack[self.t_idx].data
+        if self._bgON:
+            im=im.astype(float)-self.bg
+        return imCV.cropROI(self.roi, im)
+
+
+    ######## frame analysis ###################################
+    def filtering(self, im):
+        return imCV.filtering(im, self.sigmaHigh, self.sigmaLow)
+
+    def matchTemplate(self, im):
+        if self._matchTemplateON:
+            return imCV.matchTemplate(im, self.gaussTemplate)
+        else:
+            return im
+
+    def thresholding(self, im):
+        return imCV.thresholding(im, self.threshold)
+
+    def frameProcessing(self, ostep='tIm'):
+        '''
+        ostep can be 'fIm', 'ccIm', 'tIm' respectively for filtered, \
+                crosscorrelated with a template or thresholded image
+        '''
+        im=self.getCurrentFrame()
+
+        fIm=self.filtering(im)
+        ptp=fIm.ptp()
+        self.ptp[self.t_idx]=ptp
+        if ostep=='fIm': return fIm
+
+        ccIm=self.matchTemplate(fIm)
+        if ostep=='ccIm': return ccIm
+
+        tIm=self.thresholding(ccIm)
+        if ostep=='tIm': return tIm
+        return im
+
+    def findContours(self):
+        '''
+        seems findcontours join contours that are near the border of the image
+        with a contour of the total image
+        '''
+        tIm=self.frameProcessing(ostep='tIm')
+        if self.ptpThresh and self.ptp[self.t_idx]<self.ptpThresh:
+            return [], []
+        cnts, areas=imCV.findContours(tIm, self.threshAreaMin, self.pix2mic)
+        return cnts, areas
+
+    def equalize(self, cnts):
+        im=self.getCurrentFrame()
+        imcorr=imCV.rescale2float(im)
+        nc=len(cnts)
+        if not nc:
+            return cnts, []
+
+        for i in arange(nc):
+            mask=zeros_like(im, uint8)
+            cv2.drawContours(mask,cnts,i,255,-1)
+
+            kernel=np.ones((5,5),np.uint8)
+            mask = cv2.dilate(mask,kernel,iterations = 1)
+            mask=mask.astype(bool)
+
+            imcorr[mask]=imCV.rescale2float(imcorr[mask])
+
+        tIm=imCV.thresholding(imcorr, self.equalizeThresh)
+        cnts, areas=imCV.findContours(tIm, self.threshAreaMin, self.pix2mic)
+        cnts, ellFits = imCV.ellipseFilterContours(cnts, self.minAxisMAX, self.minAxisMIN)
+
+        return cnts, ellFits
+
+
+    def analyseFrameFull(self):
+        cnts, _=self.findContours()
+
+        if self._equalizeON:
+            cnts, ellFits =self.equalize(cnts)
+
+        cnts, ellFits = imCV.ellipseFilterContours(cnts, self.minAxisMAX, self.minAxisMIN)
+
+        if len(cnts)==0:
+            return array(([], [], [], [], []))
+
+        coms,psis,lams = transpose(amap(imCV.findCOM , cnts))
+        im=self.getCurrentFrame()
+        meanPixIs= amap(lambda cnt: imCV.findMeanPixI(cnt, im), cnts)
+
+
+        quantities=array([coms,psis,lams,meanPixIs, ellFits])
+        return quantities
+
+    def analyseFrames(self):
+        dt=diff(self.stack.time())
+        self.Nbacts = 0
+        self.bacts=[]
+
+        self.t_idx=self.tStart
+
+        while (self.t_idx < self.tEnd):
+            print '\ranalysing frame %d'%self.t_idx,
+            sys.stdout.flush()
+
+            try:
+                self.getCurrentFrame()
+            except KeyError:
+                dt[self.t_idx]+=dt[self.t_idx-1]
+                self.t_idx+=1
+                print 'frame skipped, dt is not corrected in the bact speed'
+                continue
+
+            coms,psis,lams,meanPixIs, ellFits=self.analyseFrameFull()
+            if self.t_idx==self.tStart:
+                labels=range(len(coms))
+            else:
+                labels = self._matchLabels(labels, lastComs,coms, \
+                                        dt[self.t_idx-1])
+
+            self._addToTrajectories(labels, coms, psis, lams, meanPixIs, ellFits)
+
+            lastComs = coms
+            self.Nbacts= len(self.bacts)
+            self.t_idx+=1
+
+        # def analyseFrameFull(self,data, ar_thresh=None):
+        #     '''
+        #         function that take in input raw image data, subtract the background, preprocess, findcontours,
+        #         return rects, coms, psis, lams
+        #         filtering only images that have an enough elongated aspect ratio
+        #     '''
+        #
+        #     dataShape=shape(data)
+        #     dataf = bactCV.preprocess(data-self.bgROI,self.sigmaHigh,self.sigmaLow,self.invert)
+        #     contours, area = bactCV.findContours(dataf,self.threshArea,self.pix2mic)
+        #     rects = map(lambda cnt: bactCV.findRect(cnt, dataShape, \
+        #                     self.plusRecthalfWidth,self.plusRecthalfHeight), contours)
+        #     coms,psis,lams  = transpose(map(bactCV.findCoM , contours))
+        #     quantities=array([rects,coms,psis,lams]) #area
+        #     #if not ar_thresh: #~10??
+        #     #quantities=compress((lams[0]/lams[1]) < ar_tresh, quantities, axis=1)
+        #
+        #     return quantities
+        #
+        # def analyseFrameRects(self,lastRects,lastLabels):
+        #     data=self.getCurrentFrame()
+        #     dataShape=shape(data)
+        #     clips = bactCV.cutOutRects(lastRects, data-self.bgROI)
+        #     newrects = []
+        #     newcoms = []
+        #     newpsis = []
+        #     newlams = []
+        #     newlabels = []
+        #
+        #     for i in range(len(lastRects)):
+        #         cnt = bactCV.clipAnalysis(clips[i],self.threshArea,self.pix2mic,self.sigmaHigh,0,self.invert)
+        #         if len(cnt) == 1:
+        #             if bactCV.testCntInRect(lastRects[i], cnt[0]):
+        #                 newrects+=[bactCV.shiftRect(lastRects[i],cnt,dataShape,self.plusRecthalfWidth,self.plusRecthalfHeight)]
+        #                 newcom,newpsi,newlam =bactCV.shiftCoM(lastRects[i],cnt)
+        #                 newcoms+=[newcom]; newpsis+=[newpsi]; newlams+=[newlam];
+            #             newlabels+=[lastLabels[i]]
+            #
+            # return newrects, newcoms, newpsis, newlams, newlabels
+
+
+    def _addToTrajectories(self,labels,coms, psis, lams, meanPixIs, ellFits):
+        for label,com,psi,lam,meanPixI, ellFit in zip(labels,coms,psis,lams, meanPixIs, ellFits):
+            if label < self.Nbacts:
+                self.bacts[label].addCom2Trajectory(com,psi,lam, meanPixI, ellFit, self.t_idx)
+            else:
+                self.bacts+=[Bacterium(label,com,psi,lam, meanPixI, ellFit, self.t_idx)]
+
+    def _matchLabels(self, labels, coms, newComs, dt):
+        '''
+        recognize the nearest bacteria between two frames,
+        there's a maximum distance accepted
+        '''
+        if len(coms)==0 or len(newComs)==0:
+            return arange(len(newComs))+self.Nbacts
+
+        distMatrix=util.distMatrix2D(coms, newComs)
+        I,J=shape(distMatrix)
+        newLabels=-ones(len(newComs), dtype=int)
+        threshMatching=self.MaxSpeed*dt/self.pix2mic#Maximum distance in pixel
+        while True:
+            ij=find((distMatrix==distMatrix.min()) & (distMatrix<threshMatching))
+            if len(ij)==0: break
+            i,j=ij[0]/J,ij[0]%J
+            newLabels[j]=labels[i]
+            #exclude
+            distMatrix[i,:]=threshMatching
+            distMatrix[:,j]=threshMatching
+            ### I should compare features of bacteria here to be sure that
+            ### it is the same bacteria of   before
+
+        #label unmatched newComs: idx contains index of unmatched newcoms
+        idx=newLabels==-1
+        newLabels[idx]=arange(count_nonzero(idx))+self.Nbacts
+        return newLabels
+    ############################   Trajectory Analysis      ############################
+    def analyseTrajectories(self, dt=0.5, calcmsd=False, bin_dt=0.1):
+        self.labels=amap(lambda b: int(b.label), self.bacts)
+        self.bact_tI=amap(lambda b: (b.t[0], b.t[-1]), self.bacts).T
+        for b in self.bacts:
+            b.calcVelocity(t=self.time, dt=dt)
+            if calcmsd: b.calcMSD(t=self.time, bin_dt=bin_dt)
+            b.addComment()
+
+
+    def calc_velocity_t(self, dt=0.5, comment_filter=None, onlyRun = False):
+        '''
+        -   dt: is the number of frame over which i mean to obtain one point,
+            defaults is fps. It should be a divident of self.Nframes
+        '''
+        velocity = zeros(self.Nframes)
+        self.Nrunbacts_t= zeros(self.Nframes, dtype=int)
+        self.analyseTrajectories(dt=dt)
+
+        ts=[]
+        vs=[]
+
+        for b in self.bacts:
+            if not b.bactFilter(comment_filter):
+                continue
+            if onlyRun:
+                cond = invert(b.tumble)
+            else:
+                cond = ones_like(b.v).astype('bool')
+            print '\r%s'%b.label
+            bt=self.time[b.t]
+            condt=(bt-bt[0]>dt/2.)*(bt[-1]-bt>dt/2.)
+            if len(cond) != sum(condt):
+                print len(cond), sum(condt)
+                print 'porcodio!'
+
+            self.Nrunbacts_t[b.t[condt][cond]]+=1
+            ts+=list(bt[condt][cond])
+            vs+=list(b.v[cond])
+
+
+        vs=array(vs)
+        ts=array(ts)
+
+        bns=arange(0, self.time[-1]+dt, dt)
+        nt, _=histogram(ts, bins=bns)
+        ht, _=histogram(ts, bins=bns, weights=ts)
+        hv, _=histogram(ts, bins=bns, weights=vs)
+        hv2, _=histogram(ts, bins=bns, weights=vs**2)
+
+        ht[nt>0]=ht[nt>0]/nt[nt>0]
+        hv[nt>0]=hv[nt>0]/nt[nt>0]*self.pix2mic
+        hv2[nt>0]=hv2[nt>0]/nt[nt>0]*self.pix2mic**2
+
+        return ht, hv, hv2-hv**2
+
+
+    ########### drawing Functions #########################
+    ''' Single Frame analysis '''
+    def drawfIm(self):
+        im=self.getCurrentFrame()
+        fIm=self.filtering(im)
+        plt.figure('Single frame analysis')
+        plt.clf()
+        plt.imshow(fIm)
+
+    def drawtIm(self):
+        im=self.getCurrentFrame()
+        fIm=self.filtering(im)
+        ccIm=self.matchTemplate(fIm)
+        tIm=self.thresholding(ccIm)
+        plt.figure('Single frame analysis')
+        plt.clf()
+        plt.imshow(tIm)
+        plt.show()
+
+    def plotCnts(self):
+        im=self.getCurrentFrame().copy()
+        cnts, _=self.findContours()
+        if self._equalizeON:
+            cnts, ellFits =self.equalize(cnts)
+        cnts,_ = imCV.ellipseFilterContours(cnts, self.minAxisMAX, self.minAxisMIN, self.majAxisMIN, self.majAxisMAX)
+        if not len(cnts):
+            return im
+
+        cntsIm=imCV.drawContours(im, cnts)
+        return cntsIm
+
+    def drawCnts(self):
+        cntsIm=self.plotCnts()
+        plt.figure('Single frame analysis')
+        plt.clf()
+        plt.imshow(cntsIm)
+
+
+
+    def drawTrajectories(self, timeInterval=None, \
+                        comment_filter=['motile','undefined'], label=None, textcol='k'):
+        if not timeInterval:
+            tStart,tEnd=[self.tStart,self.tEnd]
+        else:
+            tStart,tEnd=timeInterval
+
+        if label==None:
+            label=self.labels
+
+        plt.clf()
+        if comment_filter: plt.title(comment_filter)
+        t_idx=self.t_idx
+        self._setTFrame(tEnd-1)
+        plt.imshow(self.getCurrentFrame())
+
+        limX, limY = self.roi[2], self.roi[3]
+        plt.xlim(0, limX);   plt.ylim(0,limY)
+
+        cond1=(self.bact_tI[0]<tEnd)*(self.bact_tI[1]>=tStart)
+        for idx in arange(self.Nbacts)[cond1]:
+            b=self.bacts[idx]
+            if not b.bactFilter(comment_filter):
+                continue
+            l=int(b.label)
+            if not l in label:
+                continue
+
+            cond=(tStart<b.t)*(tEnd>=b.t)
+            if cond.any():
+                plt.plot(b.x[cond],b.y[cond], color=self._col[l%6]) #len(self._col)=6
+                plt.text(b.x[cond][0],b.y[cond][0],str(l), fontsize=6, color=textcol)
+            '''
+            t0 = max(tStart-b.t[0], 0)
+            t1 = max(t0, tEnd-b.t[0])
+            if (tStart<b.t[-1]) and (tEnd>=b.t[0]) :
+                plt.plot(b.x[t0:t1],b.y[t0:t1], color=self._col[l%6]) #len(self._col)=6
+                plt.text(b.x[t0],b.y[t0],str(l), fontsize=6, color=textcol)
+            '''
+        self._setTFrame(t_idx)
+        plt.show()
+
+    def drawTrajectoriesOnImage(self, timeInterval=None, \
+                        comment_filter=['motile','undefined'], label=None,lw=2,Vlimits=None,WienerFilter=False):
+        if not timeInterval:
+            tStart,tEnd=[0,self.Nframes]
+        else:
+            tStart,tEnd=timeInterval
+
+        if label==None:
+            label=self.labels
+
+        t_idx=self.t_idx
+        self._setTFrame(tEnd-1)
+        im=self.getCurrentFrame().copy()
+        if Vlimits is None:
+            Vlimits=array([im.min(),im.ptp()])
+        im=im.astype(float)
+        if WienerFilter:
+            im=wiener(im)
+        im-=Vlimits[0]
+        im=im/Vlimits[1]*255
+        im[im>255]=255
+        im[im<0]=0
+        im=im.astype(uint8)
+        #convert to RGB image
+        im=cv2.cvtColor(im,cv2.COLOR_GRAY2RGB)
+
+        cond1=(self.bact_tI[0]<tEnd)*(self.bact_tI[1]>=tStart)
+        for idx in arange(self.Nbacts)[cond1]:
+            b=self.bacts[idx]
+            if not b.bactFilter(comment_filter):
+                continue
+            l=int(b.label)
+            if not l in label:
+                continue
+
+            cond=(tStart<b.t)*(tEnd>=b.t)
+            if cond.any():
+                t=array([b.x[cond],b.y[cond]]).transpose()
+                col=(array(mpl.colors.colorConverter.to_rgb(self._col[l%6]))*255).astype(int)
+                im=cv2.polylines(im,[t.astype(int32)],False,col,lw)
+
+        self._setTFrame(t_idx)
+        return im
+
+
+    def drawSingleTrajectory(self, label, t=-1, crop_exp=25):
+        '''
+        crop_expansion should be some more than the length of a bacterium, in pixel
+        '''
+        idx=find(self.labels==label)[0]
+        if (t > self.bacts[idx].t[-1] or t==-1): t=self.bacts[idx].t[-1]
+        b = self.bacts[idx]
+        t0 = b.t[0]
+        self._setTFrame(t)
+        f=self.getCurrentFrame()
+        h,w=f.shape
+        x0=max(0, int(min(b.x))-crop_exp)
+        x1=min(w-1,int(max(b.x))+crop_exp)
+        y0=max(0, int(min(b.y))-crop_exp)
+        y1=min(h-1,int(max(b.y))+crop_exp)
+
+        self.t_idx=t
+
+        #h,w=im.shape
+        f8=imCV.rescale2uint8(f)
+        nim=f8[:,:,newaxis].repeat(3, axis=2)
+        im=Image.fromarray(nim)
+        draw=ImageDraw.Draw(im)
+
+        points=list(zip(b.x[b.t<=t],b.y[b.t<=t]))
+        draw.line(points, fill=(0,255,0), width=1)
+
+        '''if we recognized a tumble draw a dot on the trajectory'''
+        #plot(b.x[0:t-t0+1][b.tumble[0:t-t0+1]],b.y[0:t-t0+1][b.tumble[0:t-t0+1]],'r.')
+        #draw.text()
+
+        del draw
+        im=asarray(im)[y1:y0:-1, x0:x1, :]
+        return im
+
+    def show_velocity_t(self, dt, calc=True, comment_filter=['motile', 'undefined']):
+        '''
+        -   a: is the number of frame over which i mean to obtain one point,
+            defaults is fps. It should be a divident of self.Nframes
+        '''
+        if calc:
+            self.calc_velocity_t(dt, comment_filter=comment_filter)
+
+        b=self.Nframes/a
+        t_max=b*a
+        times=self.time[:t_max].reshape((b,a)).mean(1)
+
+        plt.figure()
+        plt.title('Mean velocity of running bacts')
+        plt.xlabel('t  [s]')
+        plt.ylabel('$v (t) [\mu m/s]$')
+        plt.plot(times, self.velocity_t, '.-')
+        plt.ylim(0)
+        plt.show()
+
+    ############################
+    ''' FILE OUTPUTS '''
+    def savebacts(self, filename, comment_filter=None):
+        '''
+        comment_filter can be ['motile', 'undefined', 'tooshort', 'clock']
+        '''
+        bacts=[]
+        counter=0
+        util.mkDirIfNotExists('%s/analysis/pkl/'%self.path)
+        for b in self.bacts:
+            if not b.bactFilter(comment_filter):
+                continue
+            #relabeling
+            b.label=str(counter)
+            bacts+=[b]
+            counter+=1
+        f = open('%s/analysis/pkl/%s'%(self.path, filename), 'wb')
+        pickle.dump(bacts, f)
+        f.close()
+        '''
+        if not filename in os.listdir(path):
+            return 'the bact file list cannot be saved'
+        '''
+
+    def saveData(self, fname, data2save=arange(6), comment_filter=None):
+        '''
+        data2save should contain an array with the respective idx of the attributes you want to save
+        t:0, x:1, y:2, psi:3, lam1:4, lam2:5, tv:6, v:7, tmsd:8, msd:9
+        '''
+        f=open('%s.txt'%fname, 'w+')
+        attrs=array('t|x|y|psi|lam1|lam2'.split('|')) #tv|v|tmsd|msd
+        attrs=attrs[data2save]
+        header='l|'+'|'.join(attrs)
+        f.write('%s\n'%header)
+        print attrs
+        for b in self.bacts:
+            if not b.bactFilter(comment_filter):
+                continue
+            data=amap(lambda p: getattr(b, p), attrs).T
+            for d in data:
+                f.write('%s' %b.label)
+                amap(lambda p:f.write('|%lf'%p), d)
+                f.write('\n')
+
+        f.close()
+
+
+    def loadbacts(self, bacts,overwrite=True):
+        if overwrite:
+            setattr(self, 'bacts', bacts)
+        else:
+            if not hasattr(self, 'bacts'):
+                self.bacts=[]
+                self.Nbacts=0
+            #relabeling
+            for b in bacts:
+                b.label=str(int(b.label)+self.Nbacts)
+            self.bacts+=bacts
+        self.Nbacts= len(self.bacts)
+        self.labels=amap(lambda b: int(b.label), self.bacts)
+        self.bact_tI=amap(lambda b: (b.t[0], b.t[-1]), self.bacts).T
+
+
+    def loadpickle(self, filename, overwrite=True):
+        try:
+            f = open(filename, 'rb')
+        except IOError:
+            print 'the %s list does not exist'%filename
+            raise IOError
+            return
+        bacts=pickle.load(f)
+        f.close()
+        self.loadbacts(bacts, overwrite)
+
+
+    def makefullVideo(self, timeInterval=None, dirname='.', comment_filter=None, label=None, comp=22,Vlimits=None, skip=1):
+        if not timeInterval:
+            tStart,tEnd=[self.tStart,self.tEnd]
+        else:
+            tStart,tEnd=timeInterval
+        util.mkDirIfNotExists(dirname)
+        os.system('rm %s/%s.avi'%(dirname, self.stack_name))
+        print 'frame %d'%tStart ,
+        for t in arange(tStart, tEnd):
+            print '\rframe %d'%t,
+            if (t-tStart)%skip:
+                continue
+            im=self.drawTrajectoriesOnImage(timeInterval=[max(0, t-int
+                       (self.fps)),t+1], comment_filter=comment_filter,
+                       label=label,Vlimits=Vlimits)
+            h,w, _=im.shape
+            im=im[:h-h%2, :w-w%2, :]
+            im=ascontiguousarray(im)
+            if t==tStart:
+                h,w, _=im.shape
+                vid=video.Video(w,h, dirname+'/%s.avi'%self.stack_name, \
+                        mode='RGB8',fps=int(self.fps/skip),compression=comp)
+            vid.append(im)
+
+        print '\nclosing video'
+        vid.close()
+
+
+    #################### VIDEO ##########################
+#    def makefullVideo(self, timeInterval=None, dirname='.', comment_filter=None, label=None, textcol='k'):
+#        if not timeInterval:
+#            tStart,tEnd=[0,self.Nframes]
+#        else:
+#            tStart,tEnd=timeInterval
+#        util.mkDirIfNotExists(dirname)
+#        os.system('rm '+dirname+'/bact_*.png '+dirname+'/%s.avi'%self.stack_path[:-4])
+#        Fig=plt.figure()
+#        print 'frame %d'%tStart ,
+#        for t in arange(tStart, tEnd):
+#            print '\rframe %d'%t,
+#            plt.clf()
+#            self.drawTrajectories(timeInterval=[max(0, t-int(self.fps)),t+1], \
+#                    comment_filter=comment_filter, label=label, textcol=textcol)
+#            #plt.pause(0.001)
+#            Fig.canvas.draw()
+#            if t==tStart:
+#                Fig.tight_layout()
+#                Fig.canvas.draw()
+#            im=video.fig2Img(Fig)
+#            if t==tStart:
+#                h,w, _=im.shape
+#                vid=video.Video(w,h, dirname+'/%s.avi'%self.stack_path[:-4], \
+#                                       mode='RGB8', fps=self.fps, compression=5)
+#            vid.append(im)
+
+#            if (t-tStart)%200==0:
+#                gc.collect()
+
+#        print '\nclosing video'
+#        vid.close()
+
+            #plt.savefig(dirname+'/bact_'+str(t-tStart)+'.png')
+
+
+        ##-r == framerate, -i == inputfile
+        #print '\n ffmpeg'
+        #os.system('ffmpeg -r '+str(self.fps)+' -i '+dirname+'/bact_%d.png -vcodec libx264 -crf 18  '+dirname+'/%s.avi'%self.stack_path[:-4])
+        #os.system('rm '+dirname+'/bact_*.png')
+
+    def makeVideo(self, label):
+        #if (not self.bacts[label].comment) or (self.bacts[label].comment=='tooshort'): return
+        dirname=self.stack_path[:-4].split('/')[-1]+'/video'
+        util.mkDirIfNotExists(dirname)
+        idx= find(self.labels==label)[0]
+        vid_ext=int(self.fps/2)
+        t0 = max(self.bacts[idx].t[0]-vid_ext,0)
+        t1 = min(self.bacts[idx].t[-1]+vid_ext, self.Nframes)
+
+        print 'bacterium %d'%label ,
+        for i in arange(t0, t1):
+            print '\r%d'%i,
+            im=self.drawSingleTrajectory(label, t=i)
+            if i==t0:
+                h,w,_=im.shape
+                vid=video.Video(w,h, '%s/%d.avi'%(dirname, label), \
+                                                    mode='RGB8', fps=self.fps, compression=5)
+            vid.append(im)
+        print '\nclosing video'
+        vid.close()
+
+    ########### set Parameters ############################
+    def _setTFrame(self, t_idx):
+        setattr(self, 't_idx', t_idx)
+    def _setTimeInterval(self, timeInterval=None):
+        if not timeInterval:
+            self.tStart,self.tEnd=[0,self.Nframes]
+        else:
+            self.tStart,self.tEnd=timeInterval
+
+    def _setROI(self, roi=None):
+        h,w =self.stack[0].data.shape
+        if roi==None:
+            self.roi=[0,0, w, h]
+        elif any(roi):
+            #self.checkROI(roi)#da scrivere in caso
+            self.roi=roi
+
+    def _setBackground(self, path='./'):
+        try:
+            self.bg=load('%s/analysis/bg/%s.npy'%(self.path, self.stack_name[:-4]))
+        except:
+            util.mkDirIfNotExists('%s/analysis/bg/'%self.path)
+            self.bg=self.stack.mean()
+            save('%s/analysis/bg/%s.npy'%(self.path, self.stack_name[:-4]), self.bg)
+        try:
+            self._bgON= not self._bgON
+        except:
+            self._bgON=True
+
+    def _setPtpThreshold(self, ptpThresh=0):
+        setattr(self, 'ptpThresh', ptpThresh)
+
+    def _setFilterSigma(self, sigmaL=0, sigmaH=0):
+        setattr(self, 'sigmaLow', sigmaL)
+        setattr(self, 'sigmaHigh', sigmaH)
+
+    def _setgaussTempPara(self, fwhm=8, tsize=29):
+        self._matchTemplateON=True
+        setattr(self, 'fwhm', fwhm)
+        setattr(self, 'tsize', tsize)
+        self.gaussTemplate=imCV.gaussTemp(fwhm, tsize)
+
+    def _setEqualizeThresh(self, equalizeThresh):
+        self._equalizeON=True
+        setattr(self, 'equalizeThresh', equalizeThresh)
+
+    def _setImageThreshold(self, threshold, otsu=False):
+        setattr(self, 'otsu', otsu)
+        if not self.otsu:
+            setattr(self, 'threshold', threshold)
+        return
+
+    def _setThreshArea(self, threshAreaMin):
+        '''theshArea is in um**2'''
+        setattr(self, 'threshAreaMin', threshAreaMin)
+
+    def _setPix2mic(self, pix2mic):
+        setattr(self, 'pix2mic', pix2mic)
+
+    def _setMaxSpeed(self, MaxSpeed):
+        '''MaxSpeed is in um/s'''
+        setattr(self, 'MaxSpeed', MaxSpeed)
+
+    def _setEllipseAxisFilter(self, minAxisMAX=None,  minAxisMIN=None, majAxisMIN=None, majAxisMAX=None):
+        setattr(self, 'minAxisMAX', minAxisMAX)
+        setattr(self, 'minAxisMIN', minAxisMIN)
+        setattr(self, 'majAxisMAX', majAxisMAX)
+        setattr(self, 'majAxisMIN', majAxisMIN)
+
+    def _setMinTrajLen(self, minTrajLen):
+        setattr(self, 'minTrajLen', minTrajLen)
+
+
+
+
+''

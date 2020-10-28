@@ -1,0 +1,79 @@
+\documentclass{report}
+
+\begin{document}
+
+\section{Camera}
+
+\subsection{C Layer}
+
+int cam_init(char *ErrMsg)
+
+int cam_open(char *ErrMsg)
+
+int cam_close(char *ErrMsg)
+
+int cam_end()
+
+int cam_snap(u_char *buf_p, unsigned int *timestamp, char *ErrMsg)
+
+int cam_stream(double fps, int external_trigger, char *ErrMsg)
+
+int cam_stop(char *ErrMsg)
+
+int cam_capture(u_char *buf_p, unsigned int *timestamp, char *ErrMsg)
+
+int cam_get_shutter(double *val, char *ErrMsg)
+
+int cam_set_shutter(double val, char *ErrMsg)
+
+int cam_get_gain(int *val, char *ErrMsg)
+
+int cam_set_gain(int val, char *ErrMsg)
+
+int cam_get_roi(int *left, int *top, int *width, int *height, char *ErrMsg)
+
+int cam_set_roi(int left, int top, int width, int height, char *ErrMsg)	
+
+int cam_get_format(char *format, char *ErrMsg)
+
+int cam_set_format(char *format, char *ErrMsg)
+
+int cam_get_shape(int *width, int *height, char *ErrMsg)
+
+int cam_get_clocks_per_sec(double *cps, char *ErrMsg)
+
+int cam_streaming(int *val, char *ErrMsg)
+
+
+\subsection{Python Layer}
+
+\subsection{Cuda Layer}
+
+\subsection{OpenGL Layer}
+
+\subsection{Qt Layer}
+
+\section{Holography}
+
+\subsection{Cuda Layer}
+
+int 
+
+
+\subsection{Python Layer}
+
+class trap(x,y,z=0,l=0)
+
+def sr(traps, w=None)
+
+def gsw(traps, iterations, w=None)
+
+def randmask(traps, w=None)
+
+def holomerge(holograms, w=None)
+
+\section{SLM}
+
+\subsection{Python Layer}
+
+\end{document}

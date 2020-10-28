@@ -1,0 +1,124 @@
+import spnav
+from spnav import sev
+from tweezers import *
+from numpy import *
+import world
+from PyQt4 import QtCore
+
+
+def rescale(x):
+	thres=50
+	if abs(x)>thres:
+		return (x-thres)/(430.-thres)
+	else:
+		return 0.
+	
+
+class navigator:
+  def __init__(self, traps, gswiter=2, stepcoeff=2.0, rotcoeff=0.1, dzcoeff=0, holoblanking=0):
+    # Updated by N. Koumakis to include contraints
+    # of motion to rotations or translations
+    if world.slm is None:
+      raise EnvironmentError, "there's no open slm in the world"
+    self.slm=world.slm
+    self.f=stepcoeff
+    self.rotcoeff=rotcoeff
+    self.dzcoeff=dzcoeff
+    self.constrRot = False
+    self.constrTra = True
+    self.timer=QtCore.QTimer()
+    self.timer.timeout.connect(self.poll)
+    self.timer.setSingleShot(True)
+    self.gswiter=gswiter
+
+    r0=array([0,0,0],dtype=float)
+    for t in traps:
+      r0+=[t.x,t.y,t.z]
+    r0/=len(traps)
+    self.r0=r0
+
+    h=holo(traps, gswiter)
+    self.slm.show(h)
+
+    print "Press button to switch between modes."
+    print "Only Translation!"
+    self.traps0=V(traps,-r0)
+    spnav.open()    
+
+
+  def poll(self):
+    if self.RUNNING:
+      #print "polling"
+      res=spnav.poll_event()
+      #print res
+      if res != 0:
+        if sev.type == spnav.EVENT_MOTION.value:
+          dx=rescale(sev.motion.x)*self.f
+          dy=rescale(sev.motion.z)*self.f
+          dz=rescale(sev.motion.y)*self.dzcoeff*self.f
+          dtheta = rescale(sev.motion.ry)*self.f*self.rotcoeff
+          dphi = rescale(sev.motion.rx)*self.f*self.rotcoeff
+          dpsi = rescale(sev.motion.rz)*self.f*self.rotcoeff
+          #dtheta = rescale(sev.motion.ry)#*self.f*self.rotcoeff
+          #dphi = rescale(sev.motion.rx)#*self.f*self.rotcoeff
+          #dpsi = rescale(sev.motion.rz)#*self.f*self.rotcoeff
+
+
+          if self.constrTra:
+            dphi = dpsi = dtheta = 0
+            if abs(dx) > abs(dy) and abs(dx) > abs(dz):
+              dy = dz = 0
+            elif abs(dy) > abs(dx) and abs(dy) > abs(dz):
+              dx = dz = 0
+            elif abs(dz*self.dzcoeff) > abs(dx) and abs(dz*self.dzcoeff) > abs(dy):
+              dx = dy = 0
+
+          if self.constrRot:
+            dx = dy = dz = 0
+            if abs(dtheta) > abs(dphi) and abs(dtheta) > abs(dpsi):
+              dphi = dpsi = 0
+            elif abs(dphi) > abs(dtheta) and abs(dphi) > abs(dpsi):
+              dtheta = dpsi = 0
+            elif abs(dpsi) > abs(dtheta) and abs(dpsi) > abs(dphi):
+              dtheta = dphi = 0
+
+          self.r0 += [dx,dy,dz]
+          self.traps0=Rz(self.traps0, dtheta)
+          self.traps0=Rx(self.traps0, dphi)
+          self.traps0=Ry(self.traps0, dpsi)
+          traps = V(self.traps0, self.r0)
+
+          #print traps
+          h=holo(traps, self.gswiter)
+          #if size(self.traps0)<3: time.sleep(0.015)
+          self.slm.show(h)
+  
+        elif sev.type == spnav.EVENT_BUTTON.value:
+          #print "buton event %d\n" % sev.button.press
+          if sev.button.press:
+            if self.constrRot:
+                self.constrRot=False
+                self.constrTra=False                
+                print "No Constraints!"
+            elif self.constrTra:
+                self.constrRot=True
+                self.constrTra=False                
+                print "Only Rotation!"
+            else: 
+                self.constrTra=True
+                self.constrRot=False                
+                print "Only Translation!"
+          #else:
+                #constrained = False
+        res=spnav.remove_events(1)
+      self.timer.start(10)
+
+    else:
+      spnav.remove_events(spnav.EVENT_ANY.value)
+
+  def start(self):
+    self.RUNNING=True
+    self.timer.start(0)
+
+  def stop(self):    
+    self.RUNNING=False

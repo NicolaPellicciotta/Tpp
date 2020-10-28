@@ -1,0 +1,8 @@
+import siteconf
+from slm.dvislm import *
+from slm.bnsslm import *
+
+if siteconf.slm=="boulder":
+  Modulator=BNSmodulator
+elif siteconf.slm in ["hamamatsu", "holoeye"]:
+  Modulator=DVImodulator

@@ -1,0 +1,216 @@
+from numpy import *
+import scipy.interpolate as intrpl
+from matplotlib.mlab import *
+import utilities as util
+
+Dt=0.4 #um**2/s 
+Dr=0.14 #rad**2/s
+
+
+def interpolateTraj(x,y):
+    L = len(x)    
+    if L < 4: 
+        '''4 is the minimum number of element that splrep interpolate '''
+        return x,y
+    t = arange(L)
+    tckx=intrpl.splrep(t,x, s=L/2)
+    tcky=intrpl.splrep(t,y, s=L/2)      
+    x = intrpl.splev(t, tckx)
+    y = intrpl.splev(t, tcky)
+    return x,y
+
+def trajDiameter(x,y):
+    '''computes the diameter of the circle that encoles the trajectory'''
+    dijmax=zeros(len(x)-1)
+    for i in range(len(x)-1):
+        dijmax[i]=max( (x[i+1:]-x[i])**2+(y[i+1:]-y[i])**2 )
+    return sqrt(dijmax.max())
+
+def calcNc(x,y): 
+    '''Nc quantifies how straight is a trajectory (1 straight, ~0 brownian/not moving)'''
+    T=len(x)
+    L=trajDiameter(x,y)
+    absV=mean(hypot(diff(x),diff(y)))
+    return [L, L/T/absV]
+    
+def calcNcMax(x,y,Dt): 
+    '''
+    use calcNc on subtrajectories of length Dt and then takes the mean
+    (Dt value should be minlen (see __init__.py) used for eliminating short trajs)
+    '''
+    Ncs=[]
+    nSubTraj=len(x)/Dt
+    for i in range(nSubTraj):
+        Ncs+=[calcNc(x[i*Dt:(i+1)*Dt],y[i*Dt:(i+1)*Dt])[1]]
+    return max(Ncs)
+    
+def calcNcTraj(x,y,dt=10):
+    '''
+    use calcNc on every segment of the trajectory; 
+    dt is the half length of the segments 
+    '''
+    T=len(x)
+    Ncs=[]
+    for i in range(T):
+        tmin,tmax=max(0,i-dt),min(T,i+dt)
+        Ncs+=[calcNc(x[tmin:tmax],y[tmin:tmax])]
+    Ncs=array(Ncs)
+    Ncs[:dt ]=Ncs[ dt]
+    Ncs[-dt:]=Ncs[-dt]
+    return array(Ncs)
+
+def msd_ds(x, y, t,ds=1):
+    difft= t[ds:]-t[:-ds]
+    dx = x[ds:]-x[:-ds]
+    dy = y[ds:]-y[:-ds]
+    dr2 = dx**2 + dy**2   
+    return difft, dr2/2. 
+
+def alldiff(arr):
+    l=len(arr)
+    A = array([arr] * l)
+    lowtri=tri(l,l,k=-1,dtype=bool)
+    DA = abs(A.T - A)[lowtri]
+    return DA
+
+def msd2d(t,x,y,bin_dt=0.1):
+    if not len(t) > 2:
+        return [array([[nan]]*(len(t)-1))]*2
+
+    ts=alldiff(t)
+    dx=alldiff(x)
+    dy=alldiff(y)    
+    msds=(dx**2+dy**2)/2.
+    
+    be_t=arange(0, ts.max()+bin_dt, bin_dt)+bin_dt/2.      
+    _, tmsd, bmsd, errMsd = util.funhist(ts, msds, bins=be_t)
+    return tmsd, bmsd     
+
+def msd2d_old(t,x,y,bin_dt=0.1):
+    if not len(t) > 2:
+        return [array([[nan]]*(len(t)-1))]*2
+    dss=arange(1, len(t))
+    ts, msds=amap(lambda ds: msd_ds(x, y, t, ds), dss).T
+    msds=concatenate(msds)
+    ts=concatenate(ts)
+         
+    be_t=arange(0, ts.max()+bin_dt, bin_dt)        
+    _, tmsd, bmsd, errMsd = util.funhist(ts, msds, bins=be_t)
+    return tmsd, bmsd         
+    
+def calcTheta2(vx, vy, dt=1):
+    theta = arctan2(vy, vx)
+    return mean(theta[dt:]-theta[:-dt])**2
+    
+def calcAbsTheta(vx,vy, dt=1):
+    '''mean angle between two steps of a trajectory at a distance dt (0 straight, pi/2 brownian)'''
+    nr=hypot(vx,vy)
+    dx=vx/nr
+    dy=vy/nr
+    theta=arccos(dx[:-dt]*dx[dt:]+dy[:-dt]*dy[dt:])
+    return mean(theta[~isnan(theta)])
+
+def calcCosVelOrient(vx,vy,psi):
+    '''computes mean cosine between orientation and velocity'''
+    ex=cos(psi[:-1])
+    ey=sin(psi[:-1])
+    sc=abs(ex*vx+ey*vy)/hypot(vx,vy)
+    return mean(sc[~isnan(sc)])
+
+def calcTortuosity(vx, vy):
+    ''' 
+    compute a quantity that is high when the trajectory is twisted and zero when it is a straight line
+    '''
+    v=hypot(vx, vy)
+    theta = arctan2(vy, vx)
+    k = theta[1:]/(v[0:-1]+v[1:])    
+    return median(abs(array(k)))
+
+def calcCircularity(x,y):
+    r2=(x-x.mean())**2+(y-y.mean())**2
+    #m=[[sum(x*x),sum(x*y)],[sum(x*y),sum(y**2)]]
+    #c=[sum(r2*x)/2,sum(r2*y)/2]
+    #x0,y0=linalg.solve(m,c)
+    #r2=(x-x0)**2+(y-y0)**2
+    #scr+=std(r02)/mean(r02)
+    return std(r2)/mean(r2)
+    #return (max(r2)-min(r2))/(max(r2)+min(r2))
+    
+def tumblePostProcessing(tumble, tmin_run=5, tmin_tumble=2):
+    '''
+    tumble is a boolean array that is True if bacterium is tumbling, False otherwise. 
+    This function correct the tumble array thus to obtain realistic tumble and run interval, fixing a minimum time for both the events.
+    '''    
+    t=0
+    T=len(tumble)
+    tumblePP= tumble.copy()
+    while(t<T):
+        t+=1
+        if tumblePP[t-1]:
+            ''' minimum duration of a run '''
+            idx=find(tumblePP[t:t+tmin_run])
+            if len(idx)>0:
+                tumblePP[t:t+idx[-1]]=True
+                t+=idx[-1]            
+            else:
+                ''' minimum duration of a tumblePP'''
+                tmin = max(0,t-tmin_tumble) 
+                idx=find(invert(tumblePP[tmin:t]))
+                if len(idx)>0:
+                    tumblePP[tmin+idx[0]:t]=False
+        
+    return tumblePP
+
+
+def find_Runtime(tumble):
+    '''
+    given the tumble vector, this function return duration of runs.
+    '''    
+    runs=[]
+    run=0    
+    if not tumble[0]: run+=1
+    for i in arange(1, len(tumble)):    
+        if not tumble[i]:
+            run+=1
+        elif not tumble[i-1]:
+            runs+=[run]
+            run = 0            
+    if run: runs+=[run]
+        
+    return runs
+    
+def find_TumbleAngle(dx, dy, tumble):
+    '''    
+    find the angle between velocity before and after a tumble event
+    '''
+    angles=[]
+    flag=False
+    for i in arange(1,len(tumble)):
+        if not tumble[i]:
+            continue
+        if (not tumble[i-1]):
+            angle1= arctan2(dy[i-1], dx[i-1])
+            flag=True
+        if i==len(tumble)-1:  # used to don't check out of array bounds
+            continue    
+        if (not tumble[i+1]) and flag:                       
+            angle2= arctan2(dy[i+1], dx[i+1])        
+            angle= angle2-angle1
+            if abs(angle)> pi: angle=(angle - (2*pi*sign(angle)))
+            angles+=[angle]
+            flag=False
+            
+    return angles
+
+
+ 
+
+
+
+
+
+    
+    
+    
+    
+

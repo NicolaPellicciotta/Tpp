@@ -1,0 +1,215 @@
+import cv2
+from matplotlib.mlab import amap
+from numpy import *
+#from skimage import filters
+from scipy.ndimage.filters import gaussian_filter
+
+try: from skimage import filters
+except:
+    print 'Otsu\' algorithm is not going to work, missing skimage'
+    SK_FILTERS=False
+
+def filtering(img, sigmaHigh=0, sigmaLow=0, invert=False):
+
+    fIm=img.copy() #filtered Image
+    if sigmaLow :
+        bg=gaussian_filter(fIm,sigmaLow)
+        fIm=fIm+((bg.mean()-bg))
+    if sigmaHigh:
+        fIm=gaussian_filter(fIm, sigmaHigh)
+    return fIm.astype(img.dtype)
+
+def thresholding(img, threshold, otsu=False):
+    if otsu and SK_FILTERS:
+        threshold=filters.threshold_otsu(img)
+    tIm=where(img > threshold, 0, 255)
+    return tIm.astype(uint8)
+
+'''
+def rightContours(cnts, imBW):
+    im1=where(img_BW==255, 1,0)
+    dImX=diff(imBW, axis=1)
+    dImY=diff(imBW, axis=0)
+    rCnts=amap(lambda cnt: rightCnt(cnt, dImX, dImY),cnts)
+    return rCnts
+
+def rightCnt(cnt, dImX, dImY):
+    amap(lambda p: , cnt[0])
+'''
+def rescale2uint8(A, invert=False) :
+    if not invert:
+        Anew = 255. *(A-A.min())/(A.ptp())
+    else:
+        Anew = 255. *(A.max()-A)/(A.ptp())
+    return Anew.astype(uint8)
+
+def rescale2float(A, invert=False) :
+    A=A.astype(float)
+    if not invert:
+        Anew = (A-A.min())/(A.ptp())
+    else:
+        Anew = (A.max()-A)/(A.ptp())
+    return Anew
+
+
+def findContours(tIm,threshArea,pix2mic):
+    #findcontours find white elements on black background
+    _, contours, _= cv2.findContours(tIm, cv2.RETR_LIST,
+            cv2.CHAIN_APPROX_SIMPLE)
+    area = amap(lambda cnt: cv2.contourArea(cnt), contours)
+    contours = compress(area > threshArea/pix2mic**2, contours, axis=0)
+    area = compress(area > threshArea/pix2mic**2, area)
+    return contours, area
+
+def drawContours(img, cnts):
+    img8=rescale2uint8(img)
+    backtorgb=cv2.cvtColor(img8, cv2.COLOR_GRAY2RGB)
+    cv2.drawContours(backtorgb, cnts, -1, color=(255, 0, 0))
+    return backtorgb
+
+def ellipseFilterContours(cnts,minAxisMAX=None,minAxisMIN=None, majAxisMIN=None, majAxisMAX=None):
+    '''
+    this function filter out the contours that, after an ellipse fitting,
+    have a minor axis higher than a threshold
+    '''
+    l=amap(len, cnts)
+    cnts=compress(l>=5, cnts, axis=0)
+    #There should be at least 5 points to fit the ellipse in function fitEllipse
+    boxs=amap(cv2.fitEllipse, cnts)
+    minaxs=amap(lambda b: b[1][0], boxs)
+    majaxs=amap(lambda b: b[1][1], boxs)
+    cond1= ones(len(boxs), dtype=bool)
+    if minAxisMIN:
+        cond2=minaxs > minAxisMIN
+        cond1=cond1*cond2
+    if minAxisMAX:
+        cond2=minaxs < minAxisMAX
+        cond1=cond1*cond2
+    if majAxisMIN:
+        cond2=majaxs > majAxisMIN
+        cond1=cond1*cond2
+    if majAxisMAX:
+        cond2=majaxs < majAxisMAX
+        cond1=cond1*cond2
+    cnts=compress(cond1, cnts, axis=0)
+    return cnts, boxs
+
+def findRect(cnt, frameShape,plusRecthalfWidth,plusRecthalfHeight):
+    x,y,w,h = cv2.boundingRect(cnt)
+    x=x-plusRecthalfWidth;  w=w+2*plusRecthalfWidth
+    y=y-plusRecthalfHeight; h=h+2*plusRecthalfHeight
+    if x < 0:
+        w=w-x;  x=0
+    if y < 0:
+        h=h-y;  y=0
+    if x+w >= frameShape[1]:
+        w=(frameShape[1]-x)
+    if y+h >= frameShape[0]:
+        h=(frameShape[0]-y)
+    return [x,y,w,h]
+
+def findCOM(cnt):
+    '''
+    this functiona analyse a contour returning its center of mass and the orientation of its principal longer axis
+    '''
+    moments = cv2.moments(cnt)
+    com = array([moments['m10']/moments['m00'], moments['m01']/moments['m00']])
+    I11 = moments['mu11']/moments['m00']
+    I20 = moments['mu20']/moments['m00']
+    I02 = moments['mu02']/moments['m00']
+
+    Delta=sqrt((I20-I02)**2 + 4*I11**2)
+    l1=(I20+I02+Delta)/2
+    l2=(I20+I02-Delta)/2
+    lam = array([l1,l2])
+    ''' higher eigenvector angle with the x axis '''
+    psi = 0.5*arctan2(2*I11,I20-I02)
+
+    return com, psi, lam
+
+def findMeanPixI(cnt, im):
+    mask=zeros_like(im, uint8)
+    cv2.drawContours(mask,cnt,0,255,-1)
+    meanPixI=cv2.mean(im,mask)[0]
+    return meanPixI
+
+def cropROI(roi, img):
+    #return a Region of interest from the image
+    X,Y,W,H=roi
+    return img[Y:(Y+H), X:(X+W)]
+
+def cutOutRects(rects, img):
+    img_cropped = amap(lambda r: cropROI(r, img), rects)
+    return img_cropped
+
+def clipAnalysis(img_cropped,thresh_Area,pix2mic,sigmaHigh, sigmaLow=0, invert=False):
+    fg = preprocess(img_cropped, sigmaHigh, sigmaLow,invert)
+    cnt_clip, area = findContours(fg,thresh_Area,pix2mic)
+    return cnt_clip
+
+#entrambe le funzioni shift prendono in input una lista di contour, e la analizzano se e' lunga 1
+def shiftRect(old_rect, cnt, frameShape, plusRecthalfWidth, plusRecthalfHeight):
+        if len(cnt) ==1:
+            (x,y,w,h) = cv2.boundingRect(cnt[0])
+            oldx= old_rect[0]
+            oldy= old_rect[1]
+            x=x+oldx-plusRecthalfWidth
+            y=y+oldy-plusRecthalfHeight
+            w=w+2*plusRecthalfWidth
+            h=h+2*plusRecthalfHeight
+            if x < 0:
+                w=w-x;  x=0
+            if y < 0:
+                h=h-y;  y=0
+            if x+w >= frameShape[1]:
+                w=(frameShape[1]-x)
+            if y+h >= frameShape[0]:
+                h=(frameShape[0]-y)
+            return [x,y,w,h]
+        else:
+            print("ERROR in shiftRect")
+            return [0,0,0,0]
+
+def shiftCoM(old_rect, cnt):
+        if len(cnt) ==1:
+            (x,y), e ,lam = findCoM(cnt[0])
+            x+=old_rect[0]
+            y+=old_rect[1]
+            return array([x,y]), e,lam
+        else:
+            print("ERROR in shiftCoM")
+            return array([0,0], 0,0,0)
+
+def testCntInRect(old_rect, cnt):
+    x_cnt, y_cnt = transpose(cnt)
+    x,y,w,h = old_rect
+    test = not ((x_cnt==1)+(x_cnt==w-2)+(y_cnt==1)+(y_cnt==h-2)).any()
+    return test
+
+
+def gaussTemp(fwhm=8, tsize=29):
+    '''
+    fwhm is the width of the template
+    tsize is the template size
+    '''
+    #norm 2d corr:
+    xyvec=arange(tsize,dtype=float32)-tsize/2.+0.5
+    X,Y=meshgrid(xyvec,xyvec)
+    Rmat=sqrt(X**2+Y**2)
+    #gtemp=exp(-(4*log(2)*Rmat**2)/(fwhm**2)).astype(float32)
+    gtemp=(1./(1+(Rmat/(fwhm*0.5))**2)).astype(float32)
+    return gtemp
+
+def matchTemplate(im, gtemp):
+    im=im.astype(float32)
+    tsize, _=gtemp.shape
+    if not im.dtype == gtemp.dtype:
+        print 'in matchTemplate:image and template have diferrent dtype'
+    cmat=cv2.matchTemplate(im,gtemp,cv2.TM_CCORR_NORMED)
+    cmat[cmat<0]=0
+
+    cmat=(cmat-cmat.min())/cmat.ptp()
+    padv=cmat.mean()
+    cmat=pad(cmat,tsize/2,'constant',constant_values=(-1,-1))
+    cmat[cmat==-1]=padv
+    return cmat
